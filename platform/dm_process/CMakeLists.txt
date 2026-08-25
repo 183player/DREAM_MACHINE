@@ -1,0 +1,2 @@
+add_library(dm_process INTERFACE)
+target_include_directories(dm_process INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})

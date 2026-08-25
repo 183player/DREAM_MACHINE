@@ -1,0 +1,9 @@
+/build/ 
+*.exe 
+*.log 
+*.tmp 
+*.hidden 
+*.lock 
+/.vs/ 
+/.idea/ 
+/.vscode/ 
