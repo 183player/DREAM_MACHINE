@@ -30,7 +30,6 @@ bool launchSubprocess(const SubprocessInfo& info,
     options.executable = info.executable;
     options.args = info.extra_args;
     options.inherit_handles = true;
-    // 不传递管道句柄，子进程通过名称连接（方式二）
     options.pipe_handle = 0;
 
     Process proc;
@@ -45,7 +44,6 @@ bool launchSubprocess(const SubprocessInfo& info,
     return true;
 }
 
-// 轮询单个管道，如果有数据则读取并记录
 void pollPipe(NamedPipe& pipe, const std::string& name) {
     DWORD bytes_available = 0;
     PipeResult peek_result = pipe.peekAvailable(bytes_available);
@@ -80,9 +78,16 @@ int main() {
     LOG_INFO("=== Dream Machine Launcher starting ===");
 
     // 2. 创建三个独立的命名管道服务端实例
-    //    使用相同的管道名称，操作系统会为每个实例分配独立的连接
-    const std::wstring PIPE_NAME = L"\\\\.\\pipe\\DreamMachine_Launcher";
-    constexpr int MAX_INSTANCES = 3;
+    //    每个子进程使用独立的管道名
+    std::string monitor_pipe_name_str = pipe_names::launcher_monitor();
+    std::string executor_pipe_name_str = pipe_names::launcher_executor();
+    std::string gui_pipe_name_str = pipe_names::launcher_gui();
+
+    std::wstring monitor_pipe_name(monitor_pipe_name_str.begin(), monitor_pipe_name_str.end());
+    std::wstring executor_pipe_name(executor_pipe_name_str.begin(), executor_pipe_name_str.end());
+    std::wstring gui_pipe_name(gui_pipe_name_str.begin(), gui_pipe_name_str.end());
+
+    constexpr int MAX_INSTANCES = 1;
 
     NamedPipe monitor_pipe;
     NamedPipe executor_pipe;
@@ -90,24 +95,24 @@ int main() {
 
     LOG_INFO("Creating three pipe instances for monitor, executor, gui...");
 
-    if (!monitor_pipe.createServer(PIPE_NAME, MAX_INSTANCES)) {
+    if (!monitor_pipe.createServer(monitor_pipe_name, MAX_INSTANCES)) {
         LOG_ERROR("Failed to create monitor pipe server");
         return 1;
     }
 
-    if (!executor_pipe.createServer(PIPE_NAME, MAX_INSTANCES)) {
+    if (!executor_pipe.createServer(executor_pipe_name, MAX_INSTANCES)) {
         LOG_ERROR("Failed to create executor pipe server");
         return 1;
     }
 
-    if (!gui_pipe.createServer(PIPE_NAME, MAX_INSTANCES)) {
+    if (!gui_pipe.createServer(gui_pipe_name, MAX_INSTANCES)) {
         LOG_ERROR("Failed to create gui pipe server");
         return 1;
     }
 
     LOG_INFO("All three pipe servers created successfully");
 
-    // 3. 启动子进程（不传递句柄，子进程通过名称连接）
+    // 3. 启动子进程
     std::vector<Process> managed_processes;
 
     std::vector<SubprocessInfo> subprocesses;
@@ -121,14 +126,12 @@ int main() {
         }
     }
 
-    // 4. 分别等待三个子进程连接到各自的管道实例
-    //    顺序无关，每个管道实例会等待对应的客户端
+    // 4. 分别等待三个子进程连接
     LOG_INFO("Waiting for subprocesses to connect...");
 
     const int expected_connections = static_cast<int>(subprocesses.size());
     int connected_count = 0;
 
-    // 等待 monitor 连接
     if (monitor_pipe.waitForClient(15000) == PipeResult::OK) {
         ++connected_count;
         LOG_INFO("monitor connected (" + std::to_string(connected_count) + "/" +
@@ -137,7 +140,6 @@ int main() {
         LOG_WARN("monitor connection timeout or failed");
     }
 
-    // 等待 executor 连接
     if (executor_pipe.waitForClient(15000) == PipeResult::OK) {
         ++connected_count;
         LOG_INFO("executor connected (" + std::to_string(connected_count) + "/" +
@@ -146,7 +148,6 @@ int main() {
         LOG_WARN("executor connection timeout or failed");
     }
 
-    // 等待 gui 连接
     if (gui_pipe.waitForClient(15000) == PipeResult::OK) {
         ++connected_count;
         LOG_INFO("gui connected (" + std::to_string(connected_count) + "/" +
@@ -162,7 +163,7 @@ int main() {
         LOG_INFO("All subprocesses connected successfully");
     }
 
-    // 5. 主循环：轮询三个管道
+    // 5. 主循环
     LOG_INFO("Entering main loop...");
 
     while (true) {
@@ -172,7 +173,6 @@ int main() {
             break;
         }
 
-        // 轮询三个管道
         pollPipe(monitor_pipe, "monitor");
         pollPipe(executor_pipe, "executor");
         pollPipe(gui_pipe, "gui");
@@ -183,7 +183,6 @@ int main() {
             break;
         }
 
-        // 检查是否所有子进程都已退出（备用逻辑）
         bool any_alive = false;
         for (const auto& proc : managed_processes) {
             if (proc.isRunning()) {
@@ -207,7 +206,6 @@ int main() {
     executor_pipe.close();
     gui_pipe.close();
 
-    // 等待子进程退出
     for (auto& proc : managed_processes) {
         if (proc.isRunning()) {
             LOG_INFO("Waiting for process (PID: " + std::to_string(proc.getPid()) + ") to exit...");

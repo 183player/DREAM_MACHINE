@@ -11,23 +11,23 @@ namespace dream_machine {
 
 namespace timeout {
     // 管道操作
-    constexpr int PIPE_READ_MS      = 3000;   // 管道读取超时
-    constexpr int PIPE_WRITE_MS     = 100;    // 管道写入超时
-    constexpr int PIPE_CONNECT_MS   = 500;    // 等待管道连接超时
+    constexpr int PIPE_READ_MS      = 3000;
+    constexpr int PIPE_WRITE_MS     = 100;
+    constexpr int PIPE_CONNECT_MS   = 500;
 
     // 进程管理
-    constexpr int PROCESS_START_MS      = 2000;   // 等待子进程启动
-    constexpr int PROCESS_SHUTDOWN_MS   = 5000;   // 等待进程优雅退出
+    constexpr int PROCESS_START_MS      = 2000;
+    constexpr int PROCESS_SHUTDOWN_MS   = 5000;
 
     // 脚本执行
-    constexpr int SCRIPT_EXECUTE_MS = 5000;   // 插件脚本执行超时
+    constexpr int SCRIPT_EXECUTE_MS = 5000;
 
     // 初始化列表
-    constexpr int INIT_LIST_ACK_MS = 3000;    // 等待 gui/executor 返回 ACK
+    constexpr int INIT_LIST_ACK_MS = 3000;
 
     // 看门狗
-    constexpr int WATCHDOG_INTERVAL_MS = 5000;   // 心跳检查间隔
-    constexpr int WATCHDOG_TIMEOUT_MS  = 15000;  // 主循环无响应判定
+    constexpr int WATCHDOG_INTERVAL_MS = 5000;
+    constexpr int WATCHDOG_TIMEOUT_MS  = 15000;
 }
 
 // ============================================================================
@@ -52,12 +52,29 @@ namespace paths {
 namespace pipe_names {
     inline const std::string PREFIX = "\\\\.\\pipe\\DreamMachine_";
 
+    // 基础管道名（用于各进程自身的服务端）
     inline std::string launcher()   { return PREFIX + "Launcher"; }
     inline std::string monitor()    { return PREFIX + "Monitor"; }
     inline std::string executor()   { return PREFIX + "Executor"; }
     inline std::string gui()        { return PREFIX + "Gui"; }
     inline std::string core_engine(const std::string& session_id) {
         return PREFIX + "Core_" + session_id;
+    }
+
+    // ============================================================
+    // launcher 为每个子进程创建的独立管道名
+    // ============================================================
+
+    inline std::string launcher_monitor() {
+        return PREFIX + "Launcher_Monitor";
+    }
+
+    inline std::string launcher_executor() {
+        return PREFIX + "Launcher_Executor";
+    }
+
+    inline std::string launcher_gui() {
+        return PREFIX + "Launcher_Gui";
     }
 }
 

@@ -66,16 +66,10 @@ void pollPipe() {
 
 } // namespace
 
-// ============================================================================
-// 主入口
-// ============================================================================
-
 int main(int argc, char* argv[]) {
-    // 1. 初始化日志
     Logger::instance().setProcessName("gui");
     LOG_INFO("=== Dream Machine GUI starting ===");
 
-    // 2. 解析命令行参数
     uintptr_t pipe_handle_value = 0;
     if (parsePipeHandleFromArgs(argc, argv, pipe_handle_value)) {
         LOG_INFO("Received --pipe-handle: " + std::to_string(pipe_handle_value));
@@ -83,19 +77,19 @@ int main(int argc, char* argv[]) {
         LOG_INFO("No --pipe-handle provided, connecting via pipe name");
     }
 
-    // 3. 初始化 Qt 应用
     QApplication app(argc, argv);
     QApplication::setApplicationName("Dream Machine");
     QApplication::setOrganizationName("DreamMachine");
 
     LOG_INFO("QApplication initialized");
 
-    // 4. 连接到 launcher 管道（如果 launcher 未运行，此步骤会失败）
-    std::wstring pipe_name = L"\\\\.\\pipe\\DreamMachine_Launcher";
+    // 连接到 launcher 的 gui 专用管道
+    std::string pipe_name_str = pipe_names::launcher_gui();
+    std::wstring pipe_name(pipe_name_str.begin(), pipe_name_str.end());
+
+    LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);
+
     NamedPipe pipe;
-
-    LOG_INFO("Connecting to launcher pipe: " + std::string(pipe_name.begin(), pipe_name.end()));
-
     if (!pipe.connect(pipe_name, 5000)) {
         LOG_ERROR("Failed to connect to launcher pipe");
         // 不退出，继续测试 QML 加载
@@ -116,11 +110,9 @@ int main(int argc, char* argv[]) {
         poll_timer.start();
     }
 
-    // 5. 创建 QML 引擎
     LOG_INFO("Creating QQmlApplicationEngine...");
     QQmlApplicationEngine engine;
 
-    // 连接 QML 引擎的警告信号
     QObject::connect(&engine, &QQmlApplicationEngine::warnings,
         [](const QList<QQmlError>& warnings) {
             for (const auto& error : warnings) {
@@ -128,7 +120,6 @@ int main(int argc, char* argv[]) {
             }
         });
 
-    // 连接 QML 引擎的加载完成信号
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreated,
         [](const QObject* obj, const QUrl& objUrl) {
             if (obj) {
@@ -138,11 +129,9 @@ int main(int argc, char* argv[]) {
             }
         });
 
-    // 加载 QML
     const QUrl qml_url = QUrl::fromLocalFile("../src/gui/qml/main.qml");
     LOG_INFO("Loading QML from: " + qml_url.toString().toStdString());
 
-    // 检查文件是否存在
     QString local_path = qml_url.toLocalFile();
     QFileInfo file_info(local_path);
     if (file_info.exists()) {
@@ -151,7 +140,6 @@ int main(int argc, char* argv[]) {
     } else {
         LOG_ERROR("QML file NOT FOUND: " + local_path.toStdString());
 
-        // 尝试绝对路径
         QString abs_path = "E:/Dream_machine_v3.0(alpha)/src/gui/qml/main.qml";
         LOG_INFO("Trying absolute path: " + abs_path.toStdString());
         QFileInfo abs_info(abs_path);
@@ -165,7 +153,6 @@ int main(int argc, char* argv[]) {
 
     engine.load(qml_url);
 
-    // 检查根对象
     if (engine.rootObjects().isEmpty()) {
         LOG_ERROR("QML engine loaded but NO ROOT OBJECTS created");
         LOG_INFO("Available import paths:");
@@ -179,11 +166,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 6. 进入 Qt 事件循环
     LOG_INFO("Entering Qt event loop...");
     int result = QApplication::exec();
 
-    // 7. 清理
     LOG_INFO("Shutting down GUI...");
     if (g_pipe) {
         g_pipe = nullptr;
