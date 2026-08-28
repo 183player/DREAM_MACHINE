@@ -7,48 +7,69 @@
 
 namespace dream_machine {
 
-    class Process {
-    public:
-        Process() = default;
-        ~Process();
+// ============================================================================
+// 进程启动选项（扩展：支持传递管道句柄）
+// ============================================================================
 
-        // 禁止拷贝
-        Process(const Process&) = delete;
-        Process& operator=(const Process&) = delete;
+struct ProcessStartOptions {
+    std::wstring executable;           // 可执行文件路径
+    std::wstring args;                 // 额外命令行参数（可选）
+    bool inherit_handles = true;       // 是否继承句柄
+    uintptr_t pipe_handle = 0;         // 要传递给子进程的管道句柄值（0 表示不传递）
+    std::wstring pipe_handle_arg = L"--pipe-handle";  // 命令行参数名
+};
 
-        // 移动语义
-        Process(Process&& other) noexcept;
-        Process& operator=(Process&& other) noexcept;
+// ============================================================================
+// Process 类
+// ============================================================================
 
-        // 启动进程
-        bool start(const std::wstring& executable,
-                   const std::wstring& args = L"",
-                   bool inherit_handles = false);
+class Process {
+public:
+    Process() = default;
+    ~Process();
 
-        // 等待进程退出
-        bool waitForExit(DWORD timeout_ms = INFINITE) const;
+    // 禁止拷贝
+    Process(const Process&) = delete;
+    Process& operator=(const Process&) = delete;
 
-        // 强制终止进程
-        bool terminate(DWORD exit_code = 1) const;
+    // 移动语义
+    Process(Process&& other) noexcept;
+    Process& operator=(Process&& other) noexcept;
 
-        // 检查进程是否仍在运行
-        [[nodiscard]] bool isRunning() const;
+    // ============================================================
+    // 启动进程（原有方法，保持兼容）
+    // ============================================================
 
-        // 获取进程 ID
-        [[nodiscard]] DWORD getPid() const { return pid_; }
+    // 原有签名：简单启动
+    bool start(const std::wstring& executable,
+               const std::wstring& args = L"",
+               bool inherit_handles = false);
 
-        // 获取内部句柄
-        [[nodiscard]] HANDLE getHandle() const { return handle_; }
+    // ============================================================
+    // 启动进程（新增：使用 ProcessStartOptions）
+    // ============================================================
 
-        // 释放句柄所有权
-        [[nodiscard]] HANDLE release();
+    // 扩展签名：支持管道句柄传递
+    bool start(const ProcessStartOptions& options);
 
-        // 获取进程退出码
-        [[nodiscard]] std::optional<DWORD> getExitCode() const;
+    // ============================================================
+    // 控制方法（不变）
+    // ============================================================
 
-    private:
-        HANDLE handle_ = nullptr;
-        DWORD pid_ = 0;
-    };
+    bool waitForExit(DWORD timeout_ms = INFINITE) const;
+    bool terminate(DWORD exit_code = 1) const;
+    [[nodiscard]] bool isRunning() const;
+    [[nodiscard]] DWORD getPid() const { return pid_; }
+    [[nodiscard]] HANDLE getHandle() const { return handle_; }
+    [[nodiscard]] HANDLE release();
+    [[nodiscard]] std::optional<DWORD> getExitCode() const;
+
+private:
+    HANDLE handle_ = nullptr;
+    DWORD pid_ = 0;
+
+    // 内部辅助：构建命令行
+    static std::wstring buildCommandLine(const ProcessStartOptions& options);
+};
 
 } // namespace dream_machine

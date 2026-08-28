@@ -2,17 +2,21 @@
 #include "pipe.h"
 
 #include "logger.h"
-#include "constants.h"
-#include "error_codes.h"
 
-#include <algorithm>
 #include <cstring>
+#include <string>
 
 namespace dream_machine {
 
 // ============================================================================
 // 构造 / 析构
 // ============================================================================
+
+NamedPipe::NamedPipe(HANDLE handle, bool owns_handle)
+    : pipe_handle_(handle)
+    , owns_handle_(owns_handle) {
+    std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
+}
 
 NamedPipe::~NamedPipe() {
     close();
@@ -27,27 +31,47 @@ NamedPipe::NamedPipe(NamedPipe&& other) noexcept
     , overlapped_(other.overlapped_)
     , io_pending_(other.io_pending_)
     , is_server_(other.is_server_)
+    , owns_handle_(other.owns_handle_)
     , read_buffer_(std::move(other.read_buffer_)) {
     other.pipe_handle_ = INVALID_HANDLE_VALUE;
     other.io_pending_ = false;
     other.is_server_ = false;
+    other.owns_handle_ = true;
     std::memset(&other.overlapped_, 0, sizeof(OVERLAPPED));
 }
 
 NamedPipe& NamedPipe::operator=(NamedPipe&& other) noexcept {
     if (this != &other) {
         close();
+
         pipe_handle_ = other.pipe_handle_;
         overlapped_ = other.overlapped_;
         io_pending_ = other.io_pending_;
         is_server_ = other.is_server_;
+        owns_handle_ = other.owns_handle_;
         read_buffer_ = std::move(other.read_buffer_);
+
         other.pipe_handle_ = INVALID_HANDLE_VALUE;
         other.io_pending_ = false;
         other.is_server_ = false;
+        other.owns_handle_ = true;
         std::memset(&other.overlapped_, 0, sizeof(OVERLAPPED));
     }
     return *this;
+}
+
+// ============================================================================
+// 新增：adopt() - 接管外部传入句柄
+// ============================================================================
+
+NamedPipe NamedPipe::adopt(uintptr_t handle_value) {
+    HANDLE h = reinterpret_cast<HANDLE>(handle_value);
+    if (h == INVALID_HANDLE_VALUE || h == nullptr) {
+        LOG_ERROR("adopt() called with invalid handle value: " + std::to_string(handle_value));
+        return NamedPipe(INVALID_HANDLE_VALUE, true);
+    }
+    LOG_INFO("adopt()接管外部句柄: " + std::to_string(handle_value));
+    return NamedPipe(h, false);  // owns_handle = false，析构时不关闭
 }
 
 // ============================================================================
@@ -62,10 +86,10 @@ bool NamedPipe::createServer(const std::wstring& pipe_name, DWORD max_instances)
         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
         max_instances,
-        4096,   // 输出缓冲区大小
-        4096,   // 输入缓冲区大小
-        0,      // 默认超时
-        nullptr // 默认安全属性
+        4096,
+        4096,
+        0,
+        nullptr
     );
 
     if (hPipe == INVALID_HANDLE_VALUE) {
@@ -77,6 +101,7 @@ bool NamedPipe::createServer(const std::wstring& pipe_name, DWORD max_instances)
 
     pipe_handle_ = hPipe;
     is_server_ = true;
+    owns_handle_ = true;
     std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
 
     std::string name_str(pipe_name.begin(), pipe_name.end());
@@ -90,7 +115,6 @@ PipeResult NamedPipe::waitForClient(DWORD timeout_ms) {
         return PipeResult::NOT_CONNECTED;
     }
 
-    // 重置 OVERLAPPED
     std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
     overlapped_.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -98,7 +122,6 @@ PipeResult NamedPipe::waitForClient(DWORD timeout_ms) {
     DWORD err = GetLastError();
 
     if (connected) {
-        // 同步连接成功
         CloseHandle(overlapped_.hEvent);
         std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
         LOG_INFO("Client connected to server pipe");
@@ -106,7 +129,6 @@ PipeResult NamedPipe::waitForClient(DWORD timeout_ms) {
     }
 
     if (err == ERROR_IO_PENDING) {
-        // 等待连接完成
         DWORD wait_result = WaitForSingleObject(overlapped_.hEvent, timeout_ms);
         CloseHandle(overlapped_.hEvent);
         std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
@@ -114,18 +136,17 @@ PipeResult NamedPipe::waitForClient(DWORD timeout_ms) {
         if (wait_result == WAIT_OBJECT_0) {
             LOG_INFO("Client connected to server pipe");
             return PipeResult::OK;
-        } else if (wait_result == WAIT_TIMEOUT) {
+        }
+        if (wait_result == WAIT_TIMEOUT) {
             CancelIoEx(pipe_handle_, &overlapped_);
             LOG_WARN("waitForClient timeout");
             return PipeResult::TIMEOUT;
-        } else {
-            LOG_ERROR("waitForClient failed: " + std::to_string(GetLastError()));
-            return mapLastError(GetLastError());
         }
+        LOG_ERROR("waitForClient failed: " + std::to_string(GetLastError()));
+        return mapLastError(GetLastError());
     }
 
     if (err == ERROR_PIPE_CONNECTED) {
-        // 客户端已连接
         CloseHandle(overlapped_.hEvent);
         std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
         LOG_INFO("Client already connected to server pipe");
@@ -145,7 +166,6 @@ PipeResult NamedPipe::waitForClient(DWORD timeout_ms) {
 bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
     close();
 
-    // 等待管道可用
     if (!WaitNamedPipeW(pipe_name.c_str(), timeout_ms)) {
         DWORD err = GetLastError();
         if (err == ERROR_SEM_TIMEOUT) {
@@ -175,6 +195,7 @@ bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
 
     pipe_handle_ = hPipe;
     is_server_ = false;
+    owns_handle_ = true;
     std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
 
     std::string name_str(pipe_name.begin(), pipe_name.end());
@@ -191,24 +212,20 @@ PipeResult NamedPipe::readLine(std::string& out_line, DWORD timeout_ms) {
         return PipeResult::NOT_CONNECTED;
     }
 
-    // 先检查缓冲区中是否已有完整行
     size_t pos = read_buffer_.find('\n');
     if (pos != std::string::npos) {
         out_line = read_buffer_.substr(0, pos);
-        // 移除已读取的部分（包括 \n）
         if (pos + 1 < read_buffer_.size()) {
             read_buffer_ = read_buffer_.substr(pos + 1);
         } else {
             read_buffer_.clear();
         }
-        // 去除末尾 \r（Windows CRLF 兼容）
         if (!out_line.empty() && out_line.back() == '\r') {
             out_line.pop_back();
         }
         return PipeResult::OK;
     }
 
-    // 需要从管道读取更多数据
     char buffer[4096];
     DWORD bytes_read = 0;
 
@@ -251,15 +268,12 @@ PipeResult NamedPipe::readLine(std::string& out_line, DWORD timeout_ms) {
         CloseHandle(overlapped_.hEvent);
 
         if (bytes_read == 0) {
-            // EOF：对端关闭了管道
             return PipeResult::BROKEN;
         }
 
-        // 追加到缓冲区
         buffer[bytes_read] = '\0';
         read_buffer_.append(buffer, bytes_read);
 
-        // 检查是否有完整行
         pos = read_buffer_.find('\n');
         if (pos != std::string::npos) {
             out_line = read_buffer_.substr(0, pos);
@@ -274,8 +288,7 @@ PipeResult NamedPipe::readLine(std::string& out_line, DWORD timeout_ms) {
             return PipeResult::OK;
         }
 
-        // 缓冲区过大保护（防止恶意数据撑爆内存）
-        if (read_buffer_.size() > 1024 * 1024) { // 1MB 上限
+        if (read_buffer_.size() > 1024 * 1024) {
             LOG_ERROR("Pipe read buffer exceeded 1MB limit");
             read_buffer_.clear();
             return PipeResult::SYSTEM_ERROR;
@@ -297,7 +310,7 @@ PipeResult NamedPipe::writeLine(const std::string& line, DWORD timeout_ms) {
     DWORD total_written = 0;
 
     while (total_written < data.size()) {
-        auto to_write = static_cast<DWORD>(data.size() - total_written);
+        DWORD to_write = static_cast<DWORD>(data.size() - total_written);
         std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
         overlapped_.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -383,7 +396,7 @@ bool NamedPipe::cancelPendingIO() {
 
     if (!CancelIoEx(pipe_handle_, &overlapped_)) {
         DWORD err = GetLastError();
-        if (err != ERROR_NOT_FOUND) { // 没有挂起的 IO 是正常情况
+        if (err != ERROR_NOT_FOUND) {
             LOG_WARN("CancelIoEx failed: " + std::to_string(err));
             return false;
         }
@@ -401,9 +414,16 @@ void NamedPipe::close() {
             DisconnectNamedPipe(pipe_handle_);
         }
 
-        CloseHandle(pipe_handle_);
+        // 只有 owns_handle_ = true 时才关闭句柄
+        if (owns_handle_) {
+            CloseHandle(pipe_handle_);
+        } else {
+            LOG_INFO("close() 跳过 CloseHandle（owns_handle = false）");
+        }
+
         pipe_handle_ = INVALID_HANDLE_VALUE;
         is_server_ = false;
+        owns_handle_ = true;
         read_buffer_.clear();
         std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
     }
@@ -414,14 +434,13 @@ bool NamedPipe::isConnected() const {
         return false;
     }
 
-    // 使用 PeekNamedPipe 检测管道状态
     DWORD bytes_available = 0;
     if (!PeekNamedPipe(pipe_handle_, nullptr, 0, nullptr, &bytes_available, nullptr)) {
         DWORD err = GetLastError();
         if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED) {
             return false;
         }
-        return true; // 其他错误可能是临时状态，乐观判断
+        return true;
     }
 
     return true;
@@ -431,6 +450,7 @@ HANDLE NamedPipe::release() {
     HANDLE h = pipe_handle_;
     pipe_handle_ = INVALID_HANDLE_VALUE;
     is_server_ = false;
+    owns_handle_ = true;
     read_buffer_.clear();
     std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
     return h;
@@ -440,24 +460,24 @@ HANDLE NamedPipe::release() {
 // 辅助方法
 // ============================================================================
 
-    PipeResult NamedPipe::mapLastError(DWORD error)
-    {
+PipeResult NamedPipe::mapLastError(DWORD error)
+{
     switch (error) {
-    case ERROR_SUCCESS:
-        return PipeResult::OK;
-    case ERROR_SEM_TIMEOUT:
-        return PipeResult::TIMEOUT;
-    case ERROR_BROKEN_PIPE:
-    case ERROR_PIPE_NOT_CONNECTED:
-        return PipeResult::BROKEN;
-    case ERROR_NO_DATA:
-        return PipeResult::WOULD_BLOCK;
-    case ERROR_PIPE_BUSY:
-        return PipeResult::BUSY;
-    case ERROR_INVALID_PARAMETER:
-        return PipeResult::INVALID_PARAM;
-    default:
-        return PipeResult::SYSTEM_ERROR;
+        case ERROR_SUCCESS:
+            return PipeResult::OK;
+        case ERROR_SEM_TIMEOUT:
+            return PipeResult::TIMEOUT;
+        case ERROR_BROKEN_PIPE:
+        case ERROR_PIPE_NOT_CONNECTED:
+            return PipeResult::BROKEN;
+        case ERROR_NO_DATA:
+            return PipeResult::WOULD_BLOCK;
+        case ERROR_PIPE_BUSY:
+            return PipeResult::BUSY;
+        case ERROR_INVALID_PARAMETER:
+            return PipeResult::INVALID_PARAM;
+        default:
+            return PipeResult::SYSTEM_ERROR;
     }
 }
 

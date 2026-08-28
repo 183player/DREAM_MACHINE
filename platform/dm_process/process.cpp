@@ -44,37 +44,74 @@ Process& Process::operator=(Process&& other) noexcept {
 }
 
 // ============================================================================
-// 启动进程
+// 私有辅助：构建命令行
+// ============================================================================
+
+std::wstring Process::buildCommandLine(const ProcessStartOptions& options)
+{
+    std::wstring cmd_line;
+
+    // 可执行文件路径（含引号保护）
+    if (options.executable.find(L' ') != std::wstring::npos) {
+        cmd_line = L"\"" + options.executable + L"\"";
+    } else {
+        cmd_line = options.executable;
+    }
+
+    // 追加用户自定义参数
+    if (!options.args.empty()) {
+        cmd_line += L" " + options.args;
+    }
+
+    // 追加管道句柄参数（如果提供了句柄值）
+    if (options.pipe_handle != 0) {
+        cmd_line += L" " + options.pipe_handle_arg + L"=" + std::to_wstring(options.pipe_handle);
+    }
+
+    return cmd_line;
+}
+
+// ============================================================================
+// 启动进程（原有签名，保持兼容）
 // ============================================================================
 
 bool Process::start(const std::wstring& executable,
                     const std::wstring& args,
                     bool inherit_handles) {
+    ProcessStartOptions options;
+    options.executable = executable;
+    options.args = args;
+    options.inherit_handles = inherit_handles;
+    // pipe_handle 默认为 0，不传递
+    return start(options);
+}
+
+// ============================================================================
+// 启动进程（新增：使用 ProcessStartOptions）
+// ============================================================================
+
+bool Process::start(const ProcessStartOptions& options) {
+    // 关闭之前持有的句柄
     if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
         CloseHandle(handle_);
         handle_ = nullptr;
         pid_ = 0;
     }
 
-    std::wstring cmd_line;
-    if (executable.find(L' ') != std::wstring::npos) {
-        cmd_line = L"\"" + executable + L"\"";
-    } else {
-        cmd_line = executable;
-    }
-    if (!args.empty()) {
-        cmd_line += L" " + args;
-    }
+    // 构建完整命令行
+    std::wstring cmd_line = buildCommandLine(options);
 
+    // 准备启动信息
     STARTUPINFOW si = {sizeof(STARTUPINFOW)};
     PROCESS_INFORMATION pi = {nullptr, nullptr, 0, 0};
 
+    // 创建进程
     BOOL success = CreateProcessW(
-        executable.c_str(),
+        options.executable.c_str(),
         cmd_line.data(),
         nullptr,
         nullptr,
-        inherit_handles,
+        options.inherit_handles ? TRUE : FALSE,
         CREATE_NO_WINDOW,
         nullptr,
         nullptr,
@@ -84,7 +121,7 @@ bool Process::start(const std::wstring& executable,
 
     if (!success) {
         DWORD err = GetLastError();
-        std::string exe_str(executable.begin(), executable.end());
+        std::string exe_str(options.executable.begin(), options.executable.end());
         LOG_ERROR("CreateProcessW failed for " + exe_str + ": error " + std::to_string(err));
         return false;
     }
@@ -93,8 +130,13 @@ bool Process::start(const std::wstring& executable,
     pid_ = pi.dwProcessId;
     CloseHandle(pi.hThread);
 
-    std::string exe_str(executable.begin(), executable.end());
-    LOG_INFO("Process started: " + exe_str + " (PID: " + std::to_string(pid_) + ")");
+    std::string exe_str(options.executable.begin(), options.executable.end());
+    if (options.pipe_handle != 0) {
+        LOG_INFO("Process started: " + exe_str + " (PID: " + std::to_string(pid_) +
+                 ", pipe-handle: " + std::to_string(options.pipe_handle) + ")");
+    } else {
+        LOG_INFO("Process started: " + exe_str + " (PID: " + std::to_string(pid_) + ")");
+    }
     return true;
 }
 
@@ -112,12 +154,12 @@ bool Process::waitForExit(DWORD timeout_ms) const
     DWORD result = WaitForSingleObject(handle_, timeout_ms);
     if (result == WAIT_OBJECT_0) {
         return true;
-    } else if (result == WAIT_TIMEOUT) {
-        return false;
-    } else {
-        LOG_ERROR("WaitForSingleObject failed: " + std::to_string(GetLastError()));
+    }
+    if (result == WAIT_TIMEOUT) {
         return false;
     }
+    LOG_ERROR("WaitForSingleObject failed: " + std::to_string(GetLastError()));
+    return false;
 }
 
 // ============================================================================

@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # 查找 Qt6（仅基础 Core，用于 JSON 和字符串）
-find_package(Qt6 REQUIRED COMPONENTS Core)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick Widgets)
 message(STATUS "Qt6 found at: ${Qt6_DIR}")
 
 # 添加子目录（基础设施先编译）
