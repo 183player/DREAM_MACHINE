@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <string>
 #include <optional>
+#include <cstdint>
 
 namespace dream_machine {
 
@@ -12,10 +13,10 @@ namespace dream_machine {
 // ============================================================================
 
 struct ProcessStartOptions {
-    std::wstring executable;           // 可执行文件路径
-    std::wstring args;                 // 额外命令行参数（可选）
-    bool inherit_handles = true;       // 是否继承句柄
-    uintptr_t pipe_handle = 0;         // 要传递给子进程的管道句柄值（0 表示不传递）
+    std::wstring executable;                      // 可执行文件路径
+    std::wstring args;                            // 额外命令行参数（可选）
+    bool inherit_handles = true;                  // 是否继承句柄
+    uintptr_t pipe_handle = 0;                    // 要传递给子进程的管道句柄值（0 表示不传递）
     std::wstring pipe_handle_arg = L"--pipe-handle";  // 命令行参数名
 };
 
@@ -37,23 +38,19 @@ public:
     Process& operator=(Process&& other) noexcept;
 
     // ============================================================
-    // 启动进程（原有方法，保持兼容）
+    // 启动进程
     // ============================================================
 
-    // 原有签名：简单启动
+    // 方式一：简单启动（向后兼容）
     bool start(const std::wstring& executable,
                const std::wstring& args = L"",
                bool inherit_handles = false);
 
-    // ============================================================
-    // 启动进程（新增：使用 ProcessStartOptions）
-    // ============================================================
-
-    // 扩展签名：支持管道句柄传递
+    // 方式二：使用 ProcessStartOptions（支持传递管道句柄）
     bool start(const ProcessStartOptions& options);
 
     // ============================================================
-    // 控制方法（不变）
+    // 进程控制
     // ============================================================
 
     bool waitForExit(DWORD timeout_ms = INFINITE) const;
@@ -68,7 +65,7 @@ private:
     HANDLE handle_ = nullptr;
     DWORD pid_ = 0;
 
-    // 内部辅助：构建命令行
+    // 内部辅助：构建完整命令行
     static std::wstring buildCommandLine(const ProcessStartOptions& options);
 };
 

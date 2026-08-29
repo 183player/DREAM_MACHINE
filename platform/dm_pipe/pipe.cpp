@@ -16,6 +16,8 @@ NamedPipe::NamedPipe(HANDLE handle, bool owns_handle)
     : pipe_handle_(handle)
     , owns_handle_(owns_handle) {
     std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
+    LOG_INFO("NamedPipe created with handle: " + std::to_string(reinterpret_cast<uintptr_t>(handle)) +
+             ", owns_handle=" + (owns_handle ? "true" : "false"));
 }
 
 NamedPipe::~NamedPipe() {
@@ -61,16 +63,32 @@ NamedPipe& NamedPipe::operator=(NamedPipe&& other) noexcept {
 }
 
 // ============================================================================
-// 新增：adopt() - 接管外部传入句柄
+// adopt() - 接管外部传入句柄
 // ============================================================================
 
 NamedPipe NamedPipe::adopt(uintptr_t handle_value) {
-    HANDLE h = reinterpret_cast<HANDLE>(handle_value);
+    auto h = reinterpret_cast<HANDLE>(handle_value);
+
+    // 验证句柄有效性
     if (h == INVALID_HANDLE_VALUE || h == nullptr) {
         LOG_ERROR("adopt() called with invalid handle value: " + std::to_string(handle_value));
         return NamedPipe(INVALID_HANDLE_VALUE, true);
     }
-    LOG_INFO("adopt()接管外部句柄: " + std::to_string(handle_value));
+
+    // 尝试通过 PeekNamedPipe 验证句柄是否有效（不消耗数据）
+    DWORD bytes_available = 0;
+    if (!PeekNamedPipe(h, nullptr, 0, nullptr, &bytes_available, nullptr)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_BROKEN_PIPE) {
+            LOG_WARN("adopt() got broken pipe handle: " + std::to_string(handle_value));
+        } else {
+            LOG_WARN("adopt() handle validation failed: " + std::to_string(err));
+        }
+        // 仍然接管句柄，让上层决定如何处理
+    }
+
+    LOG_INFO("adopt()接管外部句柄: " + std::to_string(handle_value) +
+             " (owns_handle=false)");
     return NamedPipe(h, false);  // owns_handle = false，析构时不关闭
 }
 
@@ -160,7 +178,7 @@ PipeResult NamedPipe::waitForClient(DWORD timeout_ms) {
 }
 
 // ============================================================================
-// 客户端模式
+// 客户端模式（通过名称连接）
 // ============================================================================
 
 bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
@@ -212,6 +230,7 @@ PipeResult NamedPipe::readLine(std::string& out_line, DWORD timeout_ms) {
         return PipeResult::NOT_CONNECTED;
     }
 
+    // 先检查缓冲区中是否已有完整行
     size_t pos = read_buffer_.find('\n');
     if (pos != std::string::npos) {
         out_line = read_buffer_.substr(0, pos);
@@ -310,7 +329,7 @@ PipeResult NamedPipe::writeLine(const std::string& line, DWORD timeout_ms) {
     DWORD total_written = 0;
 
     while (total_written < data.size()) {
-        DWORD to_write = static_cast<DWORD>(data.size() - total_written);
+        auto to_write = static_cast<DWORD>(data.size() - total_written);
         std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
         overlapped_.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -416,9 +435,10 @@ void NamedPipe::close() {
 
         // 只有 owns_handle_ = true 时才关闭句柄
         if (owns_handle_) {
+            LOG_INFO("close() closing handle: " + std::to_string(reinterpret_cast<uintptr_t>(pipe_handle_)));
             CloseHandle(pipe_handle_);
         } else {
-            LOG_INFO("close() 跳过 CloseHandle（owns_handle = false）");
+            LOG_INFO("close() skipping CloseHandle (owns_handle=false)");
         }
 
         pipe_handle_ = INVALID_HANDLE_VALUE;
@@ -434,12 +454,14 @@ bool NamedPipe::isConnected() const {
         return false;
     }
 
+    // 使用 PeekNamedPipe 检测管道状态
     DWORD bytes_available = 0;
     if (!PeekNamedPipe(pipe_handle_, nullptr, 0, nullptr, &bytes_available, nullptr)) {
         DWORD err = GetLastError();
         if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED) {
             return false;
         }
+        // 其他错误可能是临时状态，乐观返回 true（上层会通过后续读写发现）
         return true;
     }
 
@@ -460,8 +482,11 @@ HANDLE NamedPipe::release() {
 // 辅助方法
 // ============================================================================
 
-PipeResult NamedPipe::mapLastError(DWORD error)
-{
+bool NamedPipe::isHandleValid() const {
+    return pipe_handle_ != INVALID_HANDLE_VALUE && pipe_handle_ != nullptr;
+}
+
+PipeResult NamedPipe::mapLastError(DWORD error) {
     switch (error) {
         case ERROR_SUCCESS:
             return PipeResult::OK;

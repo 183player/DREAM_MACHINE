@@ -45,6 +45,11 @@ void pollPipe() {
         return;
     }
 
+    if (!g_pipe->isValid()) {
+        LOG_WARN("Pipe is invalid");
+        return;
+    }
+
     DWORD bytes_available = 0;
     PipeResult peek_result = g_pipe->peekAvailable(bytes_available);
 
@@ -70,46 +75,48 @@ int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("gui");
     LOG_INFO("=== Dream Machine GUI starting ===");
 
-    uintptr_t pipe_handle_value = 0;
-    if (parsePipeHandleFromArgs(argc, argv, pipe_handle_value)) {
-        LOG_INFO("Received --pipe-handle: " + std::to_string(pipe_handle_value));
-    } else {
-        LOG_INFO("No --pipe-handle provided, connecting via pipe name");
+    // 1. 解析命令行参数，获取父进程传递的管道句柄
+    uintptr_t handle_value = 0;
+    if (!parsePipeHandleFromArgs(argc, argv, handle_value)) {
+        LOG_ERROR("No --pipe-handle provided, cannot connect to launcher");
+        return 1;
     }
 
+    LOG_INFO("Received --pipe-handle: " + std::to_string(handle_value));
+
+    // 2. 接管父进程传递的管道句柄
+    NamedPipe pipe = NamedPipe::adopt(handle_value);
+    if (!pipe.isValid()) {
+        LOG_ERROR("Failed to adopt pipe handle: " + std::to_string(handle_value));
+        return 1;
+    }
+
+    LOG_INFO("Successfully adopted pipe handle: " + std::to_string(handle_value));
+
+    // 3. 发送注册消息
+    std::string register_msg = R"({"type":"register","process":"gui"})";
+    if (pipe.writeLine(register_msg) != PipeResult::OK) {
+        LOG_ERROR("Failed to send registration message to launcher");
+        // 继续运行，允许 GUI 在离线模式下启动
+    } else {
+        LOG_INFO("Registration message sent to launcher: " + register_msg);
+    }
+
+    // 4. 初始化 Qt 应用
     QApplication app(argc, argv);
     QApplication::setApplicationName("Dream Machine");
     QApplication::setOrganizationName("DreamMachine");
 
     LOG_INFO("QApplication initialized");
 
-    // 连接到 launcher 的 gui 专用管道
-    std::string pipe_name_str = pipe_names::launcher_gui();
-    std::wstring pipe_name(pipe_name_str.begin(), pipe_name_str.end());
+    // 5. 设置管道轮询（使用 QTimer 非阻塞轮询）
+    g_pipe = &pipe;
+    QTimer poll_timer;
+    poll_timer.setInterval(50);
+    QObject::connect(&poll_timer, &QTimer::timeout, pollPipe);
+    poll_timer.start();
 
-    LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);
-
-    NamedPipe pipe;
-    if (!pipe.connect(pipe_name, 5000)) {
-        LOG_ERROR("Failed to connect to launcher pipe");
-        // 不退出，继续测试 QML 加载
-    } else {
-        LOG_INFO("Connected to launcher pipe");
-
-        std::string register_msg = R"({"type":"register","process":"gui"})";
-        if (pipe.writeLine(register_msg) != PipeResult::OK) {
-            LOG_ERROR("Failed to send registration message");
-        } else {
-            LOG_INFO("Registration message sent: " + register_msg);
-        }
-
-        g_pipe = &pipe;
-        QTimer poll_timer;
-        poll_timer.setInterval(50);
-        QObject::connect(&poll_timer, &QTimer::timeout, pollPipe);
-        poll_timer.start();
-    }
-
+    // 6. 创建 QML 引擎
     LOG_INFO("Creating QQmlApplicationEngine...");
     QQmlApplicationEngine engine;
 
@@ -121,7 +128,7 @@ int main(int argc, char* argv[]) {
         });
 
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreated,
-        [](const QObject* obj, const QUrl& objUrl) {
+        [](QObject* obj, const QUrl& objUrl) {
             if (obj) {
                 LOG_INFO("QML object created for: " + objUrl.toString().toStdString());
             } else {
@@ -166,13 +173,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // 7. 进入 Qt 事件循环
     LOG_INFO("Entering Qt event loop...");
     int result = QApplication::exec();
 
+    // 8. 清理
     LOG_INFO("Shutting down GUI...");
-    if (g_pipe) {
-        g_pipe = nullptr;
-    }
+    poll_timer.stop();
+    g_pipe = nullptr;
     pipe.close();
 
     LOG_INFO("=== GUI exited with code " + std::to_string(result) + " ===");

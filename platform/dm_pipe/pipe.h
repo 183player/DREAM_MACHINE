@@ -33,24 +33,30 @@ public:
     NamedPipe& operator=(NamedPipe&& other) noexcept;
 
     // ============================================================
-    // 创建/连接（原有方法不变）
+    // 服务端模式
     // ============================================================
 
     bool createServer(const std::wstring& pipe_name, DWORD max_instances = 1);
     PipeResult waitForClient(DWORD timeout_ms = INFINITE);
+
+    // ============================================================
+    // 客户端模式（通过名称连接）
+    // ============================================================
+
     bool connect(const std::wstring& pipe_name, DWORD timeout_ms = 5000);
 
     // ============================================================
-    // 新增：接管外部传入句柄（方式一：命令行传递）
+    // 核心新增：接管外部传入句柄（方式一：命令行传递）
     // ============================================================
 
     // 将外部传入的句柄值包装为 NamedPipe 对象
     // handle_value: 从命令行解析的句柄值（uintptr_t）
     // 调用后本对象接管该句柄，但 owns_handle_ = false（析构时不关闭）
+    // 返回值：如果句柄无效，返回一个无效的 NamedPipe 对象（isValid() == false）
     static NamedPipe adopt(uintptr_t handle_value);
 
     // ============================================================
-    // 读写操作（原有方法不变）
+    // 读写操作
     // ============================================================
 
     PipeResult readLine(std::string& out_line, DWORD timeout_ms = 3000);
@@ -58,16 +64,24 @@ public:
     PipeResult peekAvailable(DWORD& out_bytes) const;
 
     // ============================================================
-    // 控制操作（原有方法不变）
+    // 控制操作
     // ============================================================
 
     bool cancelPendingIO();
     void close();
+
+    // 检查连接是否有效（句柄有效且管道未断开）
     [[nodiscard]] bool isConnected() const;
+
+    // 检查句柄是否有效（不检查连接状态）
+    [[nodiscard]] bool isValid() const { return pipe_handle_ != INVALID_HANDLE_VALUE && pipe_handle_ != nullptr; }
+
+    // 获取原始句柄（用于启动子进程时传递）
     [[nodiscard]] HANDLE getHandle() const { return pipe_handle_; }
 
     // 释放句柄所有权（调用后本对象不再持有句柄）
     // 用于：将句柄传递给子进程前，从父进程释放所有权
+    // 注意：调用后本对象变为无效状态，不应再使用
     [[nodiscard]] HANDLE release();
 
     // 检查本对象是否拥有句柄的所有权（控制析构行为）
@@ -81,10 +95,13 @@ private:
     OVERLAPPED overlapped_ = {};
     bool io_pending_ = false;
     bool is_server_ = false;
-    bool owns_handle_ = true;      // 析构时是否调用 CloseHandle
+    bool owns_handle_ = true;      // true: 析构时调用 CloseHandle
     std::string read_buffer_;
 
-    static PipeResult mapLastError(DWORD error);
+    // 检查句柄是否可读/写（内部辅助）
+    bool isHandleValid() const;
+
+    static PipeResult mapLastError(DWORD error) ;
 };
 
 } // namespace dream_machine

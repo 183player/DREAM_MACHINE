@@ -22,15 +22,26 @@ struct SubprocessInfo {
     std::wstring name;
     std::wstring executable;
     std::wstring extra_args;
+    NamedPipe* pipe;  // 指向对应的管道对象
 };
 
 bool launchSubprocess(const SubprocessInfo& info,
                       std::vector<Process>& managed_processes) {
+    if (!info.pipe) {
+        LOG_ERROR("Invalid pipe for " + std::string(info.name.begin(), info.name.end()));
+        return false;
+    }
+
+    // 获取管道句柄值
+    HANDLE pipe_handle = info.pipe->getHandle();
+    auto handle_value = reinterpret_cast<uintptr_t>(pipe_handle);
+
     ProcessStartOptions options;
     options.executable = info.executable;
     options.args = info.extra_args;
     options.inherit_handles = true;
-    options.pipe_handle = 0;
+    options.pipe_handle = handle_value;
+    options.pipe_handle_arg = L"--pipe-handle";
 
     Process proc;
     if (!proc.start(options)) {
@@ -40,11 +51,17 @@ bool launchSubprocess(const SubprocessInfo& info,
 
     managed_processes.push_back(std::move(proc));
     LOG_INFO("Launched " + std::string(info.name.begin(), info.name.end()) +
-             " (PID: " + std::to_string(managed_processes.back().getPid()) + ")");
+             " (PID: " + std::to_string(managed_processes.back().getPid()) +
+             ", pipe-handle: " + std::to_string(handle_value) + ")");
     return true;
 }
 
 void pollPipe(NamedPipe& pipe, const std::string& name) {
+    if (!pipe.isValid()) {
+        LOG_WARN("[" + name + "] Pipe is invalid");
+        return;
+    }
+
     DWORD bytes_available = 0;
     PipeResult peek_result = pipe.peekAvailable(bytes_available);
 
@@ -77,21 +94,19 @@ int main() {
     Logger::instance().setProcessName("launcher");
     LOG_INFO("=== Dream Machine Launcher starting ===");
 
-    // 2. 创建三个独立的命名管道服务端实例
-    //    每个子进程使用独立的管道名
-    std::string monitor_pipe_name_str = pipe_names::launcher_monitor();
-    std::string executor_pipe_name_str = pipe_names::launcher_executor();
-    std::string gui_pipe_name_str = pipe_names::launcher_gui();
-
-    std::wstring monitor_pipe_name(monitor_pipe_name_str.begin(), monitor_pipe_name_str.end());
-    std::wstring executor_pipe_name(executor_pipe_name_str.begin(), executor_pipe_name_str.end());
-    std::wstring gui_pipe_name(gui_pipe_name_str.begin(), gui_pipe_name_str.end());
-
+    // 2. 创建三个独立的命名管道服务端
+    //    每个子进程使用独立的管道，通过句柄传递而非名称约定
     constexpr int MAX_INSTANCES = 1;
 
     NamedPipe monitor_pipe;
     NamedPipe executor_pipe;
     NamedPipe gui_pipe;
+
+    // 使用临时名称创建管道（句柄将被传递给子进程，子进程不需要知道名称）
+    const std::wstring PIPE_NAME_TEMPLATE = L"\\\\.\\pipe\\DreamMachine_Launcher_";
+    std::wstring monitor_pipe_name = PIPE_NAME_TEMPLATE + L"Monitor_" + std::to_wstring(GetCurrentProcessId());
+    std::wstring executor_pipe_name = PIPE_NAME_TEMPLATE + L"Executor_" + std::to_wstring(GetCurrentProcessId());
+    std::wstring gui_pipe_name = PIPE_NAME_TEMPLATE + L"Gui_" + std::to_wstring(GetCurrentProcessId());
 
     LOG_INFO("Creating three pipe instances for monitor, executor, gui...");
 
@@ -112,13 +127,13 @@ int main() {
 
     LOG_INFO("All three pipe servers created successfully");
 
-    // 3. 启动子进程
+    // 3. 启动子进程（传递管道句柄）
     std::vector<Process> managed_processes;
 
     std::vector<SubprocessInfo> subprocesses;
-    subprocesses.push_back(SubprocessInfo{L"monitor", L"monitor.exe", L""});
-    subprocesses.push_back(SubprocessInfo{L"executor", L"executor.exe", L""});
-    subprocesses.push_back(SubprocessInfo{L"gui", L"gui.exe", L""});
+    subprocesses.push_back(SubprocessInfo{L"monitor", L"monitor.exe", L"", &monitor_pipe});
+    subprocesses.push_back(SubprocessInfo{L"executor", L"executor.exe", L"", &executor_pipe});
+    subprocesses.push_back(SubprocessInfo{L"gui", L"gui.exe", L"", &gui_pipe});
 
     for (const auto& info : subprocesses) {
         if (!launchSubprocess(info, managed_processes)) {
@@ -126,7 +141,7 @@ int main() {
         }
     }
 
-    // 4. 分别等待三个子进程连接
+    // 4. 等待子进程连接
     LOG_INFO("Waiting for subprocesses to connect...");
 
     const int expected_connections = static_cast<int>(subprocesses.size());
@@ -167,22 +182,18 @@ int main() {
     LOG_INFO("Entering main loop...");
 
     while (true) {
-        // 先检查 GUI 管道是否断开（用户关闭窗口）
-        if (!gui_pipe.isConnected()) {
-            LOG_INFO("GUI pipe disconnected, launcher shutting down");
+        // 检查所有管道连接状态
+        bool monitor_connected = monitor_pipe.isConnected();
+        bool executor_connected = executor_pipe.isConnected();
+        bool gui_connected = gui_pipe.isConnected();
+
+        // 如果任何子进程断开，则退出
+        if (!monitor_connected || !executor_connected || !gui_connected) {
+            LOG_INFO("A subprocess pipe disconnected, launcher shutting down");
             break;
         }
 
-        pollPipe(monitor_pipe, "monitor");
-        pollPipe(executor_pipe, "executor");
-        pollPipe(gui_pipe, "gui");
-
-        // 检查各管道连接状态（备用逻辑）
-        if (!monitor_pipe.isConnected() && !executor_pipe.isConnected() && !gui_pipe.isConnected()) {
-            LOG_INFO("All pipes are broken, launcher shutting down");
-            break;
-        }
-
+        // 检查子进程是否还存活
         bool any_alive = false;
         for (const auto& proc : managed_processes) {
             if (proc.isRunning()) {
@@ -196,6 +207,10 @@ int main() {
             break;
         }
 
+        pollPipe(monitor_pipe, "monitor");
+        pollPipe(executor_pipe, "executor");
+        pollPipe(gui_pipe, "gui");
+
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
@@ -206,14 +221,11 @@ int main() {
     executor_pipe.close();
     gui_pipe.close();
 
+    // 主动终止所有子进程
     for (auto& proc : managed_processes) {
         if (proc.isRunning()) {
-            LOG_INFO("Waiting for process (PID: " + std::to_string(proc.getPid()) + ") to exit...");
-            proc.waitForExit(3000);
-            if (proc.isRunning()) {
-                LOG_WARN("Process (PID: " + std::to_string(proc.getPid()) + ") still running, terminating...");
-                proc.terminate();
-            }
+            LOG_INFO("Terminating process (PID: " + std::to_string(proc.getPid()) + ")...");
+            proc.terminate();
         }
     }
 

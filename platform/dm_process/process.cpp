@@ -47,8 +47,7 @@ Process& Process::operator=(Process&& other) noexcept {
 // 私有辅助：构建命令行
 // ============================================================================
 
-std::wstring Process::buildCommandLine(const ProcessStartOptions& options)
-{
+std::wstring Process::buildCommandLine(const ProcessStartOptions& options) {
     std::wstring cmd_line;
 
     // 可执行文件路径（含引号保护）
@@ -66,13 +65,14 @@ std::wstring Process::buildCommandLine(const ProcessStartOptions& options)
     // 追加管道句柄参数（如果提供了句柄值）
     if (options.pipe_handle != 0) {
         cmd_line += L" " + options.pipe_handle_arg + L"=" + std::to_wstring(options.pipe_handle);
+        LOG_INFO("buildCommandLine: added --pipe-handle=" + std::to_string(options.pipe_handle));
     }
 
     return cmd_line;
 }
 
 // ============================================================================
-// 启动进程（原有签名，保持兼容）
+// 启动进程（原有签名，保持向后兼容）
 // ============================================================================
 
 bool Process::start(const std::wstring& executable,
@@ -82,12 +82,12 @@ bool Process::start(const std::wstring& executable,
     options.executable = executable;
     options.args = args;
     options.inherit_handles = inherit_handles;
-    // pipe_handle 默认为 0，不传递
+    options.pipe_handle = 0;  // 默认不传递句柄
     return start(options);
 }
 
 // ============================================================================
-// 启动进程（新增：使用 ProcessStartOptions）
+// 启动进程（核心实现）
 // ============================================================================
 
 bool Process::start(const ProcessStartOptions& options) {
