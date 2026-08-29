@@ -1,0 +1,55 @@
+{
+  "colors": {
+    "primary": "#3A7BD5",
+    "primary_hover": "#4A8BE5",
+    "secondary": "#888888",
+    "background": "#1E1E2E",
+    "background_alt": "#2A2A3E",
+    "surface": "#2D2D44",
+    "surface_alt": "#3A3A5A",
+    "text_primary": "#EEEEEE",
+    "text_secondary": "#AAAAAA",
+    "text_muted": "#666666",
+    "border": "#3A3A5A",
+    "success": "#4CAF50",
+    "warning": "#FFC107",
+    "error": "#F44336",
+    "info": "#2196F3"
+  },
+  "fonts": {
+    "family": "Segoe UI, sans-serif",
+    "size_small": 10,
+    "size_normal": 12,
+    "size_large": 14,
+    "size_title": 18,
+    "size_huge": 24,
+    "weight_normal": 400,
+    "weight_bold": 600
+  },
+  "spacing": {
+    "button_gap": 6,
+    "list_item_gap": 4,
+    "padding_small": 4,
+    "padding_normal": 8,
+    "padding_large": 16,
+    "margin_small": 4,
+    "margin_normal": 8,
+    "margin_large": 16,
+    "border_radius": 4,
+    "icon_size": 16
+  },
+  "layout": {
+    "session_list_width": 200,
+    "chat_area_padding": 12,
+    "input_area_height": 60,
+    "status_bar_height": 24,
+    "min_window_width": 800,
+    "min_window_height": 600
+  },
+  "animation": {
+    "duration_short": 150,
+    "duration_normal": 300,
+    "duration_long": 500,
+    "easing_type": "easeInOut"
+  }
+}

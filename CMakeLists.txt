@@ -21,3 +21,12 @@ add_subdirectory(src/monitor)
 add_subdirectory(src/executor)
 add_subdirectory(src/gui)
 add_subdirectory(src/core_engine)
+
+# ============================================================
+# 默认系统插件（必须放在所有进程目标之后，因为需要依赖它们）
+# ============================================================
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/default_plugin/manifest.json)
+    add_subdirectory(src/default_plugin)
+else()
+    message(WARNING "Default plugin manifest not found: ${CMAKE_SOURCE_DIR}/src/default_plugin/manifest.json")
+endif()

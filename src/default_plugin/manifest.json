@@ -1,0 +1,33 @@
+{
+  "id": "dream_machine_default",
+  "name": "Dream Machine 默认界面",
+  "version": "1.0.0",
+  "system": true,
+  "type": "framework",
+  "modification": "replace",
+  "target": {
+    "file": "qml/main.qml"
+  },
+  "entry": {
+    "framework": "qml/main.qml",
+    "components": [
+      "qml/components/SessionList.qml",
+      "qml/components/ChatView.qml",
+      "qml/components/InputBar.qml",
+      "qml/components/ButtonListContainer.qml",
+      "qml/components/SearchButton.qml"
+    ],
+    "cards": ["qml/cards/TracePopup.qml"],
+    "global_params": "config/global_params.json",
+    "scripts": []
+  },
+  "triggers": {},
+  "can_delete": false,
+  "can_disable": false,
+  "overridable": true,
+  "override_policy": {
+    "allow_function_change": true,
+    "allow_style_change": true,
+    "allow_position_change": true
+  }
+}

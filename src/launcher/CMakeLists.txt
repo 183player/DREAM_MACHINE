@@ -1,4 +1,6 @@
-add_executable(launcher main.cpp)
+add_executable(launcher main.cpp
+        plugin_manager.h
+        plugin_manager.cpp)
 
 target_link_libraries(launcher PRIVATE
         Qt6::Core

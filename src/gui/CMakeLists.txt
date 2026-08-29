@@ -1,8 +1,33 @@
-add_executable(gui main.cpp)
+# src/gui/CMakeLists.txt
 
-# 启用 MOC（元对象编译器）
+find_package(Qt6 REQUIRED COMPONENTS Core Qml Quick Widgets)
+
+add_executable(gui
+        main.cpp
+        plugin_loader.cpp
+        plugin_loader.h
+        session_state_manager.h
+        status_provider.h
+)
+
+# 启用 MOC
 set(CMAKE_AUTOMOC ON)
 
+# 显式让 AUTOMOC 处理头文件（双重保险）
+set_source_files_properties(
+        session_state_manager.h
+        status_provider.h
+        PROPERTIES AUTOMOC ON
+)
+
+# 额外显式生成 moc 文件，确保链接（强烈推荐）
+qt6_wrap_cpp(moc_sources
+        session_state_manager.h
+        status_provider.h
+)
+target_sources(gui PRIVATE ${moc_sources})
+
+# 链接库
 target_link_libraries(gui PRIVATE
         Qt6::Core
         Qt6::Gui
@@ -14,10 +39,9 @@ target_link_libraries(gui PRIVATE
         dm_pipe
 )
 
-# 额外显式包含目录（确保 Clangd 和编译器都能找到）
+# 包含目录
 target_include_directories(gui PRIVATE
-        ${Qt6Core_INCLUDE_DIRS}
-        ${Qt6Gui_INCLUDE_DIRS}
-        ${Qt6Qml_INCLUDE_DIRS}
-        ${Qt6Quick_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/platform/dm_base
+        ${CMAKE_SOURCE_DIR}/platform/dm_pipe
+        ${CMAKE_SOURCE_DIR}/platform/dm_logger
 )
