@@ -14,29 +14,8 @@
 #include <QString>
 
 #include <string>
-#include <cstdlib>
 
 using namespace dream_machine;
-
-namespace {
-
-bool parsePipeHandleFromArgs(int argc, char* argv[], uintptr_t& out_handle) {
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        const std::string prefix = "--pipe-handle=";
-        if (arg.find(prefix) == 0) {
-            std::string value_str = arg.substr(prefix.length());
-            try {
-                out_handle = std::stoull(value_str);
-                return true;
-            } catch (const std::exception&) {
-                LOG_ERROR("Failed to parse --pipe-handle value: " + value_str);
-                return false;
-            }
-        }
-    }
-    return false;
-}
 
 NamedPipe* g_pipe = nullptr;
 
@@ -46,7 +25,6 @@ void pollPipe() {
     }
 
     if (!g_pipe->isValid()) {
-        LOG_WARN("Pipe is invalid");
         return;
     }
 
@@ -69,54 +47,48 @@ void pollPipe() {
     }
 }
 
-} // namespace
-
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("gui");
     LOG_INFO("=== Dream Machine GUI starting ===");
 
-    // 1. 解析命令行参数，获取父进程传递的管道句柄
-    uintptr_t handle_value = 0;
-    if (!parsePipeHandleFromArgs(argc, argv, handle_value)) {
-        LOG_ERROR("No --pipe-handle provided, cannot connect to launcher");
+    // 通过名称连接 launcher
+    std::string pipe_name_str = pipe_names::launcher_gui();
+    std::wstring pipe_name(pipe_name_str.begin(), pipe_name_str.end());
+
+    LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);
+
+    NamedPipe pipe;
+    if (!pipe.connect(pipe_name, 5000)) {
+        LOG_ERROR("Failed to connect to launcher pipe");
         return 1;
     }
 
-    LOG_INFO("Received --pipe-handle: " + std::to_string(handle_value));
+    LOG_INFO("Connected to launcher pipe");
 
-    // 2. 接管父进程传递的管道句柄
-    NamedPipe pipe = NamedPipe::adopt(handle_value);
-    if (!pipe.isValid()) {
-        LOG_ERROR("Failed to adopt pipe handle: " + std::to_string(handle_value));
-        return 1;
-    }
-
-    LOG_INFO("Successfully adopted pipe handle: " + std::to_string(handle_value));
-
-    // 3. 发送注册消息
+    // 发送注册消息
     std::string register_msg = R"({"type":"register","process":"gui"})";
     if (pipe.writeLine(register_msg) != PipeResult::OK) {
-        LOG_ERROR("Failed to send registration message to launcher");
-        // 继续运行，允许 GUI 在离线模式下启动
+        LOG_ERROR("Failed to send registration message");
+        // 继续运行，允许离线模式
     } else {
-        LOG_INFO("Registration message sent to launcher: " + register_msg);
+        LOG_INFO("Registration message sent: " + register_msg);
     }
 
-    // 4. 初始化 Qt 应用
+    // 初始化 Qt 应用
     QApplication app(argc, argv);
     QApplication::setApplicationName("Dream Machine");
     QApplication::setOrganizationName("DreamMachine");
 
     LOG_INFO("QApplication initialized");
 
-    // 5. 设置管道轮询（使用 QTimer 非阻塞轮询）
+    // 管道轮询
     g_pipe = &pipe;
     QTimer poll_timer;
     poll_timer.setInterval(50);
     QObject::connect(&poll_timer, &QTimer::timeout, pollPipe);
     poll_timer.start();
 
-    // 6. 创建 QML 引擎
+    // QML 引擎
     LOG_INFO("Creating QQmlApplicationEngine...");
     QQmlApplicationEngine engine;
 
@@ -146,16 +118,6 @@ int main(int argc, char* argv[]) {
         LOG_INFO("File size: " + std::to_string(file_info.size()));
     } else {
         LOG_ERROR("QML file NOT FOUND: " + local_path.toStdString());
-
-        QString abs_path = "E:/Dream_machine_v3.0(alpha)/src/gui/qml/main.qml";
-        LOG_INFO("Trying absolute path: " + abs_path.toStdString());
-        QFileInfo abs_info(abs_path);
-        if (abs_info.exists()) {
-            LOG_INFO("Absolute path file exists");
-            engine.load(QUrl::fromLocalFile(abs_path));
-        } else {
-            LOG_ERROR("Absolute path file also not found");
-        }
     }
 
     engine.load(qml_url);
@@ -173,11 +135,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 7. 进入 Qt 事件循环
     LOG_INFO("Entering Qt event loop...");
     int result = QApplication::exec();
 
-    // 8. 清理
     LOG_INFO("Shutting down GUI...");
     poll_timer.stop();
     g_pipe = nullptr;

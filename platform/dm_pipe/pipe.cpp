@@ -96,8 +96,16 @@ NamedPipe NamedPipe::adopt(uintptr_t handle_value) {
 // 服务端模式
 // ============================================================================
 
-bool NamedPipe::createServer(const std::wstring& pipe_name, DWORD max_instances) {
+    bool NamedPipe::createServer(const std::wstring& pipe_name, DWORD max_instances) {
     close();
+
+    // ============================================================
+    // 关键修复：设置安全属性，使句柄可继承
+    // ============================================================
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.lpSecurityDescriptor = nullptr;
+    sa.bInheritHandle = TRUE;  // 允许子进程继承此句柄
 
     HANDLE hPipe = CreateNamedPipeW(
         pipe_name.c_str(),
@@ -107,7 +115,7 @@ bool NamedPipe::createServer(const std::wstring& pipe_name, DWORD max_instances)
         4096,
         4096,
         0,
-        nullptr
+        &sa  // 传入安全属性，不再是 nullptr
     );
 
     if (hPipe == INVALID_HANDLE_VALUE) {
@@ -123,7 +131,8 @@ bool NamedPipe::createServer(const std::wstring& pipe_name, DWORD max_instances)
     std::memset(&overlapped_, 0, sizeof(OVERLAPPED));
 
     std::string name_str(pipe_name.begin(), pipe_name.end());
-    LOG_INFO("Named pipe server created: " + name_str);
+    LOG_INFO("Named pipe server created: " + name_str + " (handle: " +
+             std::to_string(reinterpret_cast<uintptr_t>(hPipe)) + ", inheritable=true)");
     return true;
 }
 
