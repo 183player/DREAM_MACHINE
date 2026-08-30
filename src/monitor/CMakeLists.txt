@@ -6,4 +6,5 @@ target_link_libraries(monitor PRIVATE
         dm_base
         dm_pipe
         dm_process
+        dm_event
 )

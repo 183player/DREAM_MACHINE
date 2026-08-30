@@ -2,104 +2,185 @@
 #include "logger.h"
 #include "pipe.h"
 #include "constants.h"
+#include "messages.h"
+#include "event_loop.h"
+#include "common_utils.h"
 
 #include <string>
 #include <thread>
 #include <chrono>
 #include <cstdlib>
 #include <tlhelp32.h>
+#include <atomic>
 
 using namespace dream_machine;
+using namespace dream_machine::event;
+using namespace dream_machine::common;
 
-// ================================================================
-// 内部辅助函数
-// ================================================================
 namespace {
 
-std::string getArgValue(int argc, char* argv[], const std::string& key) {
-    for (int i = 1; i < argc - 1; ++i) {
-        if (argv[i] == key) {
-            return argv[i + 1];
-        }
+NamedPipe* g_executor_pipe = nullptr;
+NamedPipe* g_monitor_pipe = nullptr;
+EventLoop* g_event_loop = nullptr;
+std::atomic<bool> g_should_stop{false};
+std::string g_session_id;
+
+// ----- 处理 monitor 消息（回调） -----
+void processMonitorMessage(EventType type, void* user_data) {
+    (void)type;
+    if (!g_monitor_pipe || g_should_stop) {
+        return;
     }
-    return {};
+
+    NamedPipe& monitor_pipe = *g_monitor_pipe;
+
+    if (monitor_pipe.isBroken()) {
+        LOG_INFO("Monitor pipe broken, stopping event loop");
+        if (g_event_loop) {
+            g_event_loop->stop();
+        }
+        return;
+    }
+
+    DWORD bytes_available = 0;
+    PipeResult peek_result = monitor_pipe.peekAvailable(bytes_available);
+
+    if (peek_result == PipeResult::PIPE_BROKEN) {
+        LOG_INFO("Monitor pipe broken (peek), stopping event loop");
+        if (g_event_loop) {
+            g_event_loop->stop();
+        }
+        return;
+    }
+
+    if (peek_result != PipeResult::PIPE_OK || bytes_available == 0) {
+        return;
+    }
+
+    std::string message;
+    PipeResult read_result = monitor_pipe.readLineBuffered(message, 100);
+
+    if (read_result == PipeResult::PIPE_OK) {
+        LOG_INFO("From monitor: " + message);
+
+        std::string type_str, cmd, payload;
+        if (parseBaseMessage(message, type_str, cmd, payload)) {
+            if (type_str == msg_types::SHUTDOWN) {
+                auto shutdown_msg = parseShutdown(payload);
+                if (shutdown_msg.has_value()) {
+                    LOG_INFO("Received SHUTDOWN from monitor, exiting");
+                    g_should_stop = true;
+                    if (g_event_loop) {
+                        g_event_loop->stop();
+                    }
+                }
+            }
+        } else {
+            LOG_WARN("Failed to parse base message from monitor");
+        }
+
+    } else if (read_result == PipeResult::PIPE_BROKEN) {
+        LOG_INFO("Monitor pipe broken (read), stopping event loop");
+        if (g_event_loop) {
+            g_event_loop->stop();
+        }
+    } else if (read_result == PipeResult::PIPE_TIMEOUT) {
+        LOG_WARN("Read timeout on monitor pipe, will retry");
+    }
 }
 
-bool verifyParentPid(DWORD expected_parent_pid) {
-    if (expected_parent_pid == 0) {
-        LOG_ERROR("Missing --parent-pid argument, refusing to run standalone");
-        return false;
+// ----- 处理 executor 消息（回调） -----
+void processExecutorMessage(EventType type, void* user_data) {
+    (void)type;
+    if (!g_executor_pipe || g_should_stop) {
+        return;
     }
 
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        LOG_ERROR("CreateToolhelp32Snapshot failed: error " + std::to_string(GetLastError()));
-        return false;
+    NamedPipe& executor_pipe = *g_executor_pipe;
+
+    if (executor_pipe.isBroken()) {
+        LOG_INFO("Executor pipe broken, stopping event loop");
+        if (g_event_loop) {
+            g_event_loop->stop();
+        }
+        return;
     }
 
-    PROCESSENTRY32W pe = {sizeof(PROCESSENTRY32W)};
-    DWORD current_pid = GetCurrentProcessId();
-    DWORD real_parent_pid = 0;
+    DWORD bytes_available = 0;
+    PipeResult peek_result = executor_pipe.peekAvailable(bytes_available);
 
-    if (Process32FirstW(snapshot, &pe)) {
-        do {
-            if (pe.th32ProcessID == current_pid) {
-                real_parent_pid = pe.th32ParentProcessID;
-                break;
-            }
-        } while (Process32NextW(snapshot, &pe));
+    if (peek_result == PipeResult::PIPE_BROKEN) {
+        LOG_INFO("Executor pipe broken (peek), stopping event loop");
+        if (g_event_loop) {
+            g_event_loop->stop();
+        }
+        return;
     }
 
-    CloseHandle(snapshot);
-
-    if (real_parent_pid == 0) {
-        LOG_ERROR("Failed to determine real parent PID");
-        return false;
+    if (peek_result != PipeResult::PIPE_OK || bytes_available == 0) {
+        return;
     }
 
-    if (real_parent_pid != expected_parent_pid) {
-        LOG_ERROR("Parent PID mismatch: expected " + std::to_string(expected_parent_pid) +
-                  ", actual " + std::to_string(real_parent_pid) + ", refusing to run");
-        return false;
-    }
+    std::string message;
+    PipeResult read_result = executor_pipe.readLineBuffered(message, 100);
 
-    LOG_INFO("Parent PID verification passed (PID: " + std::to_string(real_parent_pid) + ")");
-    return true;
+    if (read_result == PipeResult::PIPE_OK) {
+        LOG_INFO("From executor: " + message);
+        // TODO: 处理操作结果（STEP_*, OP_DONE, OP_ABORT）
+
+    } else if (read_result == PipeResult::PIPE_BROKEN) {
+        LOG_INFO("Executor pipe broken (read), stopping event loop");
+        if (g_event_loop) {
+            g_event_loop->stop();
+        }
+    } else if (read_result == PipeResult::PIPE_TIMEOUT) {
+        LOG_WARN("Read timeout on executor pipe, will retry");
+    }
+}
+
+// ----- 心跳日志（定时回调） -----
+int g_heartbeat_counter = 0;
+
+void logHeartbeat(EventType type, void* user_data) {
+    (void)type;
+    (void)user_data;
+
+    ++g_heartbeat_counter;
+    if (g_heartbeat_counter % 100 == 0) {
+        LOG_INFO("Core engine heartbeat: " + std::to_string(g_heartbeat_counter) +
+                 " iterations (session: " + g_session_id + ")");
+    }
 }
 
 } // namespace
 
+// ================================================================
+// main 入口
+// ================================================================
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("core_engine");
     LOG_INFO("=== Dream Machine Core Engine starting ===");
 
-    // ============================================================
-    // 第一步：解析并验证启动参数（双重校验，防止独立启动）
-    // ============================================================
-
-    // 1.1 获取并验证父进程 PID（必须是 monitor）
-    std::string parent_pid_str = getArgValue(argc, argv, "--parent-pid");
+    // 使用 common_utils 解析参数并验证父进程
+    std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
     DWORD expected_parent_pid = 0;
     if (!parent_pid_str.empty()) {
         expected_parent_pid = static_cast<DWORD>(std::stoul(parent_pid_str));
     }
 
-    if (!verifyParentPid(expected_parent_pid)) {
+    if (!common::verifyParentPid(expected_parent_pid)) {
         return 1;
     }
 
-    // 1.2 获取并验证 session_id（必须非空）
-    std::string session_id = getArgValue(argc, argv, "--session-id");
-    if (session_id.empty()) {
+    g_session_id = common::getArgValue(argc, argv, "--session-id");
+    if (g_session_id.empty()) {
         LOG_ERROR("Missing --session-id argument, refusing to run");
         return 1;
     }
 
-    LOG_INFO("Session ID: " + session_id);
+    LOG_INFO("Session ID: " + g_session_id);
 
-    // ============================================================
-    // 第二步：连接到 executor（直接连接，无需重试）
-    // ============================================================
+    // ----- 连接到 executor -----
     std::string executor_pipe_name_str = pipe_names::executor_core();
     std::wstring executor_pipe_name(executor_pipe_name_str.begin(),
                                      executor_pipe_name_str.end());
@@ -114,10 +195,8 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("Connected to executor pipe");
 
-    // ============================================================
-    // 第三步：连接到 monitor（直接连接，无需重试）
-    // ============================================================
-    std::string monitor_pipe_name_str = pipe_names::monitor_core(session_id);
+    // ----- 连接到 monitor -----
+    std::string monitor_pipe_name_str = pipe_names::monitor_core(g_session_id);
     std::wstring monitor_pipe_name(monitor_pipe_name_str.begin(),
                                     monitor_pipe_name_str.end());
 
@@ -131,11 +210,11 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("Connected to monitor pipe");
 
-    // ============================================================
-    // 第四步：向 monitor 发送注册消息
-    // ============================================================
-    std::string register_msg = R"({"type":"register","cmd":"REGISTER_SESSION","payload":{"session_id":")" +
-                               session_id + R"("}})";
+    // ----- 发送 REGISTER_SESSION -----
+    RegisterSessionMessage reg_msg;
+    reg_msg.session_id = g_session_id;
+    std::string register_msg = serializeRegisterSession(reg_msg);
+
     if (monitor_pipe.writeLine(register_msg) != PipeResult::PIPE_OK) {
         LOG_ERROR("Failed to send REGISTER_SESSION to monitor, exiting");
         return 1;
@@ -143,99 +222,84 @@ int main(int argc, char* argv[]) {
     LOG_INFO("REGISTER_SESSION sent to monitor: " + register_msg);
 
     // ============================================================
-    // 第五步：主循环（同时监控 monitor 和 executor）
+    // 初始化事件循环
     // ============================================================
-    LOG_INFO("Entering main loop...");
+    g_executor_pipe = &executor_pipe;
+    g_monitor_pipe = &monitor_pipe;
 
-    int heartbeat_counter = 0;
-    constexpr int HEARTBEAT_INTERVAL = 100;
+    EventLoop event_loop;
+    g_event_loop = &event_loop;
 
-    while (true) {
-        // 检查 monitor 管道
-        if (monitor_pipe.isBroken()) {
-            LOG_INFO("Monitor pipe broken, core_engine shutting down");
-            break;
-        }
-
-        // 检查 executor 管道
-        if (executor_pipe.isBroken()) {
-            LOG_INFO("Executor pipe broken, core_engine shutting down");
-            break;
-        }
-
-        // ---- 处理 monitor 消息 ----
-        DWORD monitor_bytes = 0;
-        PipeResult monitor_peek = monitor_pipe.peekAvailable(monitor_bytes);
-
-        if (monitor_peek == PipeResult::PIPE_BROKEN) {
-            LOG_INFO("Monitor pipe broken (peek), core_engine shutting down");
-            break;
-        }
-
-        if (monitor_peek == PipeResult::PIPE_OK && monitor_bytes > 0) {
-            std::string message;
-            PipeResult read_result = monitor_pipe.readLine(message, 100);
-
-            if (read_result == PipeResult::PIPE_OK) {
-                LOG_INFO("From monitor: " + message);
-                // TODO: 处理 SHUTDOWN 等命令
-                if (message.find("\"SHUTDOWN\"") != std::string::npos) {
-                    LOG_INFO("Received SHUTDOWN from monitor, exiting");
-                    break;
-                }
-            } else if (read_result == PipeResult::PIPE_BROKEN) {
-                LOG_INFO("Monitor pipe broken (read), core_engine shutting down");
-                break;
-            }
-        }
-
-        // ---- 处理 executor 消息 ----
-        DWORD executor_bytes = 0;
-        PipeResult executor_peek = executor_pipe.peekAvailable(executor_bytes);
-
-        if (executor_peek == PipeResult::PIPE_BROKEN) {
-            LOG_INFO("Executor pipe broken (peek), core_engine shutting down");
-            break;
-        }
-
-        if (executor_peek == PipeResult::PIPE_OK && executor_bytes > 0) {
-            std::string message;
-            PipeResult read_result = executor_pipe.readLine(message, 100);
-
-            if (read_result == PipeResult::PIPE_OK) {
-                LOG_INFO("From executor: " + message);
-                // TODO: 处理操作结果（STEP_*, OP_DONE, OP_ABORT）
-            } else if (read_result == PipeResult::PIPE_BROKEN) {
-                LOG_INFO("Executor pipe broken (read), core_engine shutting down");
-                break;
-            }
-        }
-
-        // ---- 心跳日志 ----
-        ++heartbeat_counter;
-        if (heartbeat_counter % HEARTBEAT_INTERVAL == 0) {
-            LOG_INFO("Core engine heartbeat: " + std::to_string(heartbeat_counter) +
-                     " iterations (session: " + session_id + ")");
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EventHandle monitor_read_handle = event_loop.registerReadable(
+        monitor_pipe.getHandle(),
+        processMonitorMessage,
+        nullptr
+    );
+    if (!monitor_read_handle.active) {
+        LOG_ERROR("Failed to register monitor pipe readable event");
+        return 1;
     }
 
-    // ============================================================
-    // 第六步：向 monitor 发送注销消息（优雅退出）
-    // ============================================================
-    LOG_INFO("Sending UNREGISTER_SESSION to monitor...");
-    std::string unregister_msg = R"({"type":"register","cmd":"UNREGISTER_SESSION","payload":{"session_id":")" +
-                                 session_id + R"("}})";
-    monitor_pipe.writeLine(unregister_msg);  // 尽力发送，忽略失败
+    EventHandle executor_read_handle = event_loop.registerReadable(
+        executor_pipe.getHandle(),
+        processExecutorMessage,
+        nullptr
+    );
+    if (!executor_read_handle.active) {
+        LOG_ERROR("Failed to register executor pipe readable event");
+        return 1;
+    }
+
+    EventHandle heartbeat_handle = event_loop.registerTimer(
+        100,
+        logHeartbeat,
+        nullptr,
+        false
+    );
+    if (!heartbeat_handle.active) {
+        LOG_ERROR("Failed to register heartbeat timer");
+        return 1;
+    }
+
+    EventHandle stop_signal = event_loop.registerSignal([](EventType type, void* data) {
+        (void)type;
+        (void)data;
+        LOG_INFO("Stop signal received");
+        g_should_stop = true;
+    });
+    if (!stop_signal.active) {
+        LOG_WARN("Failed to register stop signal");
+    }
+
+    LOG_INFO("Entering event-driven main loop...");
+    event_loop.run();
 
     // ============================================================
-    // 第七步：清理
+    // 发送 UNREGISTER_SESSION
+    // ============================================================
+    LOG_INFO("Sending UNREGISTER_SESSION to monitor...");
+    UnregisterSessionMessage unreg_msg;
+    unreg_msg.session_id = g_session_id;
+    std::string unregister_msg = serializeUnregisterSession(unreg_msg);
+    (void)monitor_pipe.writeLine(unregister_msg);
+
+    // ============================================================
+    // 清理
     // ============================================================
     LOG_INFO("Shutting down core_engine...");
+
+    event_loop.unregister(monitor_read_handle);
+    event_loop.unregister(executor_read_handle);
+    event_loop.unregister(heartbeat_handle);
+    event_loop.unregister(stop_signal);
+
     monitor_pipe.close();
     executor_pipe.close();
 
-    LOG_INFO("=== Core Engine exited (session: " + session_id + ") ===");
+    g_executor_pipe = nullptr;
+    g_monitor_pipe = nullptr;
+    g_event_loop = nullptr;
+
+    LOG_INFO("=== Core Engine exited (session: " + g_session_id + ") ===");
     return 0;
 }

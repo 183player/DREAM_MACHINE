@@ -6,6 +6,7 @@
 #include "session_state_manager.h"
 #include "plugin_loader.h"
 #include "status_provider.h"
+#include "common_utils.h"
 
 #include <QApplication>
 #include <QQmlApplicationEngine>
@@ -13,92 +14,158 @@
 #include <QTimer>
 #include <QUrl>
 #include <QObject>
-#include <QDebug>
 #include <QFileInfo>
 #include <QFile>
 #include <QString>
 #include <QCoreApplication>
 #include <QDir>
 #include <QQuickWindow>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QVariantMap>
+#include <QPointer>
 
 #include <string>
 #include <cstdlib>
 #include <tlhelp32.h>
+#include <memory>
+#include <atomic>
 
 using namespace dream_machine;
 using namespace dream_machine::gui;
+using namespace dream_machine::common;
 
+// ================================================================
+// 全局状态（使用 unique_ptr / QPointer 管理）
+// ================================================================
+static std::unique_ptr<NamedPipe> g_pipe;
+static QPointer<SessionStateManager> g_sessionManager;
+static QPointer<QQmlApplicationEngine> g_engine;
+static std::unique_ptr<PluginLoader> g_pluginLoader;
+static QPointer<StatusProvider> g_statusProvider;
+static QPointer<QObject> g_placeholderWindow;
+static std::unique_ptr<QTimer> g_timeoutTimer;
+static std::unique_ptr<QTimer> g_showPlaceholderTimer;
+static std::atomic<bool> g_should_stop{false};
+
+// ================================================================
+// 内部辅助（匿名命名空间）
+// ================================================================
 namespace {
-
-NamedPipe* g_pipe = nullptr;
-SessionStateManager* g_sessionManager = nullptr;
-QQmlApplicationEngine* g_engine = nullptr;
-PluginLoader* g_pluginLoader = nullptr;
-StatusProvider* g_statusProvider = nullptr;
-QObject* g_placeholderWindow = nullptr;
-QTimer* g_timeoutTimer = nullptr;
-QTimer* g_showPlaceholderTimer = nullptr;   // 延迟显示占位窗口
 
 bool isDevMode() {
     const char* dev_mode = std::getenv("DM_DEV_MODE");
     return dev_mode && std::string(dev_mode) == "1";
 }
 
-std::string getArgValue(int argc, char* argv[], const std::string& key) {
-    for (int i = 1; i < argc - 1; ++i) {
-        if (argv[i] == key) {
-            return argv[i + 1];
+QVariantMap loadGlobalParams() {
+    QVariantMap result;
+
+    QString config_path = "plugins/system/dream_machine_default/config/global_params.json";
+    if (QFile::exists(config_path)) {
+        QFile file(config_path);
+        if (file.open(QIODevice::ReadOnly)) {
+            QByteArray data = file.readAll();
+            file.close();
+            QJsonParseError error;
+            QJsonDocument doc = QJsonDocument::fromJson(data, &error);
+            if (error.error == QJsonParseError::NoError && doc.isObject()) {
+                result = doc.object().toVariantMap();
+                LOG_INFO("global_params.json loaded from: " + config_path.toStdString());
+                return result;
+            }
         }
     }
-    return {};
-}
 
-bool verifyParentPid(DWORD expected_parent_pid) {
-    if (expected_parent_pid == 0) {
-        LOG_ERROR("Missing --parent-pid argument, refusing to run standalone");
-        return false;
-    }
-
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        LOG_ERROR("CreateToolhelp32Snapshot failed: error " + std::to_string(GetLastError()));
-        return false;
-    }
-
-    PROCESSENTRY32W pe = {sizeof(PROCESSENTRY32W)};
-    DWORD current_pid = GetCurrentProcessId();
-    DWORD real_parent_pid = 0;
-
-    if (Process32FirstW(snapshot, &pe)) {
-        do {
-            if (pe.th32ProcessID == current_pid) {
-                real_parent_pid = pe.th32ParentProcessID;
-                break;
+    if (isDevMode()) {
+        QString project_root = QDir::currentPath();
+        QDir proj_dir(project_root);
+        if (proj_dir.dirName() == "bin") {
+            proj_dir.cdUp();
+            proj_dir.cdUp();
+        }
+        config_path = proj_dir.filePath("src/default_plugin/config/global_params.json");
+        if (QFile::exists(config_path)) {
+            QFile file(config_path);
+            if (file.open(QIODevice::ReadOnly)) {
+                QByteArray data = file.readAll();
+                file.close();
+                QJsonParseError error;
+                QJsonDocument doc = QJsonDocument::fromJson(data, &error);
+                if (error.error == QJsonParseError::NoError && doc.isObject()) {
+                    result = doc.object().toVariantMap();
+                    LOG_INFO("global_params.json loaded from (dev): " + config_path.toStdString());
+                    return result;
+                }
             }
-        } while (Process32NextW(snapshot, &pe));
+        }
     }
 
-    CloseHandle(snapshot);
+    LOG_WARN("global_params.json not found, using minimal defaults");
+    QVariantMap colors;
+    colors["background"] = "#F0F0F0";
+    colors["background_alt"] = "#E8E8E8";
+    colors["surface"] = "#FFFFFF";
+    colors["surface_alt"] = "#F5F5F5";
+    colors["text_primary"] = "#333333";
+    colors["text_secondary"] = "#666666";
+    colors["text_muted"] = "#999999";
+    colors["border"] = "#D0D0D0";
+    colors["primary"] = "#3A7BD5";
+    colors["primary_hover"] = "#4A8BE5";
+    colors["secondary"] = "#888888";
+    colors["success"] = "#4CAF50";
+    colors["warning"] = "#FFC107";
+    colors["error"] = "#F44336";
+    colors["info"] = "#2196F3";
+    result["colors"] = colors;
 
-    if (real_parent_pid == 0) {
-        LOG_ERROR("Failed to determine real parent PID");
-        return false;
-    }
+    QVariantMap fonts;
+    fonts["family"] = "Segoe UI";
+    fonts["size_small"] = 10;
+    fonts["size_normal"] = 12;
+    fonts["size_large"] = 14;
+    fonts["size_title"] = 18;
+    fonts["size_huge"] = 24;
+    fonts["weight_normal"] = 400;
+    fonts["weight_bold"] = 600;
+    result["fonts"] = fonts;
 
-    if (real_parent_pid != expected_parent_pid) {
-        LOG_ERROR("Parent PID mismatch: expected " + std::to_string(expected_parent_pid) +
-                  ", actual " + std::to_string(real_parent_pid) + ", refusing to run");
-        return false;
-    }
+    QVariantMap spacing;
+    spacing["button_gap"] = 6;
+    spacing["list_item_gap"] = 4;
+    spacing["padding_small"] = 4;
+    spacing["padding_normal"] = 8;
+    spacing["padding_large"] = 16;
+    spacing["margin_small"] = 4;
+    spacing["margin_normal"] = 8;
+    spacing["margin_large"] = 16;
+    spacing["border_radius"] = 4;
+    spacing["icon_size"] = 16;
+    result["spacing"] = spacing;
 
-    LOG_INFO("Parent PID verification passed (PID: " + std::to_string(real_parent_pid) + ")");
-    return true;
+    QVariantMap layout;
+    layout["session_list_width"] = 200;
+    layout["chat_area_padding"] = 12;
+    layout["input_area_height"] = 60;
+    layout["status_bar_height"] = 24;
+    layout["min_window_width"] = 800;
+    layout["min_window_height"] = 600;
+    result["layout"] = layout;
+
+    QVariantMap animation;
+    animation["duration_short"] = 150;
+    animation["duration_normal"] = 300;
+    animation["duration_long"] = 500;
+    animation["easing_type"] = "easeInOut";
+    result["animation"] = animation;
+
+    return result;
 }
 
-// ----- 显示占位窗口（由定时器触发） -----
 void showPlaceholderWindow() {
     if (g_placeholderWindow) {
-        QQuickWindow* win = qobject_cast<QQuickWindow*>(g_placeholderWindow);
+        QQuickWindow* win = qobject_cast<QQuickWindow*>(g_placeholderWindow.data());
         if (win && !win->isVisible()) {
             win->setVisible(true);
             LOG_INFO("Placeholder window shown due to loading delay");
@@ -110,19 +177,17 @@ void showPlaceholderWindow() {
     }
 }
 
-// ----- 隐藏或删除占位窗口（成功加载时调用） -----
 void hidePlaceholderWindow() {
     if (g_showPlaceholderTimer) {
         g_showPlaceholderTimer->stop();
     }
     if (g_placeholderWindow) {
         g_placeholderWindow->deleteLater();
-        g_placeholderWindow = nullptr;
+        g_placeholderWindow.clear();
         LOG_INFO("Placeholder window destroyed");
     }
 }
 
-// ----- 处理 INIT_LIST 消息 -----
 void handleInitList(const std::string& payload) {
     if (!g_pluginLoader || !g_statusProvider) {
         LOG_ERROR("PluginLoader or StatusProvider not initialized");
@@ -136,11 +201,13 @@ void handleInitList(const std::string& payload) {
     if (success) {
         g_statusProvider->setStatusText("插件加载成功");
         g_statusProvider->setLoading(false);
-
-        // 取消延迟显示定时器，隐藏占位窗口
         hidePlaceholderWindow();
 
-        // 如果框架已加载，发送 ACK
+        if (g_timeoutTimer) {
+            g_timeoutTimer->stop();
+            LOG_INFO("Global timeout timer stopped");
+        }
+
         if (g_pluginLoader->isFrameworkLoaded()) {
             LOG_INFO("Framework loaded successfully");
         }
@@ -158,7 +225,6 @@ void handleInitList(const std::string& payload) {
         g_statusProvider->setLoading(false);
         g_statusProvider->setShowExitButton(true);
 
-        // 取消延迟显示定时器，立即显示占位窗口（如果尚未显示）
         if (g_showPlaceholderTimer) {
             g_showPlaceholderTimer->stop();
         }
@@ -176,78 +242,37 @@ void handleInitList(const std::string& payload) {
     }
 }
 
-void handleInitSessionList(const std::string& /*message*/) {
+void handleInitSessionList(const std::string& payload) {
     if (!g_sessionManager) {
+        return;
+    }
+    auto msg = parseInitSessionList(payload);
+    if (!msg.has_value()) {
+        LOG_WARN("Failed to parse INIT_SESSION_LIST");
         return;
     }
     g_sessionManager->clearAll();
     LOG_INFO("Initialized session list (empty)");
 }
 
-void handleSessionStateUpdate(const std::string& message) {
+void handleSessionStateUpdate(const std::string& payload) {
     if (!g_sessionManager) {
         return;
     }
 
-    std::string session_id;
-    std::string state;
-
-    size_t id_pos = message.find("\"session_id\"");
-    if (id_pos != std::string::npos) {
-        size_t start = message.find('\"', id_pos + 14);
-        if (start != std::string::npos) {
-            size_t end = message.find('\"', start + 1);
-            if (end != std::string::npos) {
-                session_id = message.substr(start + 1, end - start - 1);
-            }
-        }
-    }
-
-    size_t state_pos = message.find("\"state\"");
-    if (state_pos != std::string::npos) {
-        size_t start = message.find('\"', state_pos + 8);
-        if (start != std::string::npos) {
-            size_t end = message.find('\"', start + 1);
-            if (end != std::string::npos) {
-                state = message.substr(start + 1, end - start - 1);
-            }
-        }
-    }
-
-    if (session_id.empty() || state.empty()) {
-        LOG_WARN("Invalid SESSION_STATE_UPDATE message");
+    auto msg = parseSessionStateUpdate(payload);
+    if (!msg.has_value()) {
+        LOG_WARN("Failed to parse SESSION_STATE_UPDATE message");
         return;
     }
 
-    LOG_INFO("Session state update: " + session_id + " -> " + state);
-    g_sessionManager->updateSessionState(session_id, state);
+    LOG_INFO("Session state update: " + msg->session_id + " -> " + msg->state);
+    g_sessionManager->updateSessionState(msg->session_id, msg->state);
 }
-
-// 全局超时处理（10秒）
-void onTimeout() {
-    // 取消延迟显示定时器
-    if (g_showPlaceholderTimer) {
-        g_showPlaceholderTimer->stop();
-    }
-
-    // 显示占位窗口
-    showPlaceholderWindow();
-
-    if (g_statusProvider) {
-        g_statusProvider->setStatusText("加载超时");
-        g_statusProvider->setErrorText("未收到 launcher 的插件列表，请检查 launcher 是否正常运行");
-        g_statusProvider->setLoading(false);
-        g_statusProvider->setShowExitButton(true);
-    }
-    LOG_ERROR("Timeout waiting for INIT_LIST");
-}
-
-// ================================================================
-// 管道轮询
-// ================================================================
 
 void pollPipe() {
-    if (!g_pipe) {
+    if (!g_pipe || g_should_stop) {
+        QApplication::quit();
         return;
     }
 
@@ -300,6 +325,21 @@ void pollPipe() {
     }
 }
 
+void onTimeout() {
+    if (g_showPlaceholderTimer) {
+        g_showPlaceholderTimer->stop();
+    }
+    showPlaceholderWindow();
+
+    if (g_statusProvider) {
+        g_statusProvider->setStatusText("加载超时");
+        g_statusProvider->setErrorText("未收到 launcher 的插件列表，请检查 launcher 是否正常运行");
+        g_statusProvider->setLoading(false);
+        g_statusProvider->setShowExitButton(true);
+    }
+    LOG_ERROR("Timeout waiting for INIT_LIST");
+}
+
 } // namespace
 
 // ================================================================
@@ -309,13 +349,14 @@ int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("gui");
     LOG_INFO("=== Dream Machine GUI starting ===");
 
-    std::string parent_pid_str = getArgValue(argc, argv, "--parent-pid");
+    // 使用 common_utils 解析参数并验证父进程
+    std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
     DWORD expected_parent_pid = 0;
     if (!parent_pid_str.empty()) {
         expected_parent_pid = static_cast<DWORD>(std::stoul(parent_pid_str));
     }
 
-    if (!verifyParentPid(expected_parent_pid)) {
+    if (!common::verifyParentPid(expected_parent_pid)) {
         return 1;
     }
 
@@ -324,19 +365,20 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);
 
-    NamedPipe pipe;
-    if (!pipe.connect(pipe_name, 5000)) {
+    auto pipe = std::make_unique<NamedPipe>();
+    if (!pipe->connect(pipe_name, 5000)) {
         LOG_ERROR("Failed to connect to launcher pipe, exiting");
         return 1;
     }
 
     LOG_INFO("Connected to launcher pipe");
+    g_pipe = std::move(pipe);
 
     RegisterMessage reg_msg;
     reg_msg.process = "gui";
     std::string register_msg = serializeRegister(reg_msg);
 
-    if (pipe.writeLine(register_msg) != PipeResult::PIPE_OK) {
+    if (g_pipe->writeLine(register_msg) != PipeResult::PIPE_OK) {
         LOG_ERROR("Failed to send registration message");
     } else {
         LOG_INFO("Registration message sent: " + register_msg);
@@ -345,32 +387,31 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("Dream Machine");
     QApplication::setOrganizationName("DreamMachine");
+    app.setStyle("Fusion");
+    LOG_INFO("QApplication initialized with Fusion style");
 
-    LOG_INFO("QApplication initialized");
+    auto statusProvider = std::make_unique<StatusProvider>();
+    g_statusProvider = statusProvider.get();
 
-    // ----- 创建状态提供者 -----
-    StatusProvider statusProvider;
-    g_statusProvider = &statusProvider;
+    auto sessionManager = std::make_unique<SessionStateManager>();
+    g_sessionManager = sessionManager.get();
 
-    // ----- 初始化会话状态管理器 -----
-    SessionStateManager sessionManager;
-    g_sessionManager = &sessionManager;
+    auto engine = std::make_unique<QQmlApplicationEngine>();
+    g_engine = engine.get();
 
-    LOG_INFO("Creating QQmlApplicationEngine...");
-    QQmlApplicationEngine engine;
-    g_engine = &engine;
+    QVariantMap globalParams = loadGlobalParams();
+    engine->rootContext()->setContextProperty("globalParams", globalParams);
+    engine->rootContext()->setContextProperty("statusProvider", statusProvider.get());
+    engine->rootContext()->setContextProperty("sessionManager", sessionManager.get());
 
-    engine.rootContext()->setContextProperty("statusProvider", &statusProvider);
-    engine.rootContext()->setContextProperty("sessionManager", &sessionManager);
-
-    QObject::connect(&engine, &QQmlApplicationEngine::warnings,
+    QObject::connect(engine.get(), &QQmlApplicationEngine::warnings,
         [](const QList<QQmlError>& warnings) {
             for (const auto& error : warnings) {
                 LOG_ERROR("QML warning: " + error.toString().toStdString());
             }
         });
 
-    QObject::connect(&engine, &QQmlApplicationEngine::objectCreated,
+    QObject::connect(engine.get(), &QQmlApplicationEngine::objectCreated,
         [](QObject* obj, const QUrl& objUrl) {
             if (obj) {
                 LOG_INFO("QML object created for: " + objUrl.toString().toStdString());
@@ -379,18 +420,16 @@ int main(int argc, char* argv[]) {
             }
         });
 
-    // ----- 初始化插件加载器 -----
-    PluginLoader pluginLoader;
-    g_pluginLoader = &pluginLoader;
-    pluginLoader.setEngine(&engine);
+    auto pluginLoader = std::make_unique<PluginLoader>();
+    g_pluginLoader = std::move(pluginLoader);
+    g_pluginLoader->setEngine(engine.get());
 
     bool dev_mode = isDevMode();
     if (dev_mode) {
         LOG_INFO("=== DEVELOPMENT MODE ENABLED ===");
-        statusProvider.setStatusText("开发模式 - 从源码加载");
+        statusProvider->setStatusText("开发模式 - 从源码加载");
     }
 
-    // ----- 加载占位窗口（默认不可见） -----
     QString app_dir = QCoreApplication::applicationDirPath();
     LOG_INFO("Application directory: " + app_dir.toStdString());
 
@@ -405,85 +444,89 @@ int main(int argc, char* argv[]) {
         placeholder_path = proj_dir.filePath("src/gui/qml/main.qml");
         QUrl url = QUrl::fromLocalFile(placeholder_path);
         if (QFile::exists(placeholder_path)) {
-            engine.load(url);
+            engine->load(url);
             LOG_INFO("Development placeholder loaded from: " + placeholder_path.toStdString());
         } else {
             LOG_WARN("Development placeholder not found, trying build directory");
             placeholder_path = QDir(app_dir).filePath("src/gui/qml/main.qml");
-            engine.load(QUrl::fromLocalFile(placeholder_path));
+            engine->load(QUrl::fromLocalFile(placeholder_path));
         }
     } else {
-        QDir base_dir(app_dir);
-        bool up1 = base_dir.cdUp();
-        bool up2 = base_dir.cdUp();
+        QDir base_dir2(app_dir);
+        bool up1 = base_dir2.cdUp();
+        bool up2 = base_dir2.cdUp();
         if (up1 && up2) {
-            placeholder_path = base_dir.filePath("src/gui/qml/main.qml");
+            placeholder_path = base_dir2.filePath("src/gui/qml/main.qml");
         } else {
             placeholder_path = app_dir + "/../src/gui/qml/main.qml";
         }
         QUrl url = QUrl::fromLocalFile(placeholder_path);
         if (QFile::exists(placeholder_path)) {
-            engine.load(url);
+            engine->load(url);
             LOG_INFO("Placeholder loaded from: " + placeholder_path.toStdString());
         } else {
             LOG_ERROR("Placeholder QML not found at: " + placeholder_path.toStdString());
-            engine.load(QUrl::fromLocalFile("../src/gui/qml/main.qml"));
+            engine->load(QUrl::fromLocalFile("../src/gui/qml/main.qml"));
         }
     }
 
-    if (!engine.rootObjects().isEmpty()) {
-        g_placeholderWindow = engine.rootObjects().first();
+    if (!engine->rootObjects().isEmpty()) {
+        g_placeholderWindow = engine->rootObjects().first();
         g_placeholderWindow->setObjectName("placeholder");
-        // 初始不可见（QML 中 visible: false）
         LOG_INFO("Placeholder window created (initially hidden)");
     }
 
-    // ----- 延迟显示定时器（500ms） -----
-    QTimer showTimer;
-    g_showPlaceholderTimer = &showTimer;
-    showTimer.setSingleShot(true);
-    showTimer.setInterval(500);
-    QObject::connect(&showTimer, &QTimer::timeout, showPlaceholderWindow);
-    showTimer.start();
+    auto showTimer = std::make_unique<QTimer>();
+    g_showPlaceholderTimer = std::move(showTimer);
+    g_showPlaceholderTimer->setSingleShot(true);
+    g_showPlaceholderTimer->setInterval(500);
+    QObject::connect(g_showPlaceholderTimer.get(), &QTimer::timeout, showPlaceholderWindow);
+    g_showPlaceholderTimer->start();
     LOG_INFO("Placeholder show timer started (500ms)");
 
-    // ----- 全局超时定时器（10秒） -----
-    QTimer timeoutTimer;
-    g_timeoutTimer = &timeoutTimer;
-    timeoutTimer.setSingleShot(true);
-    timeoutTimer.setInterval(10000);
-    QObject::connect(&timeoutTimer, &QTimer::timeout, onTimeout);
-    timeoutTimer.start();
+    auto timeoutTimer = std::make_unique<QTimer>();
+    g_timeoutTimer = std::move(timeoutTimer);
+    g_timeoutTimer->setSingleShot(true);
+    g_timeoutTimer->setInterval(10000);
+    QObject::connect(g_timeoutTimer.get(), &QTimer::timeout, onTimeout);
+    g_timeoutTimer->start();
 
-    // ----- 设置管道轮询 -----
-    g_pipe = &pipe;
-    QTimer poll_timer;
-    poll_timer.setInterval(50);
-    QObject::connect(&poll_timer, &QTimer::timeout, pollPipe);
-    poll_timer.start();
+    QTimer pollTimer;
+    pollTimer.setInterval(50);
+    QObject::connect(&pollTimer, &QTimer::timeout, pollPipe);
+    pollTimer.start();
 
-    // ----- 进入 Qt 事件循环 -----
     LOG_INFO("Entering Qt event loop...");
     int result = QApplication::exec();
 
-    // ----- 清理 -----
     LOG_INFO("Shutting down GUI...");
-    poll_timer.stop();
-    timeoutTimer.stop();
-    showTimer.stop();
+    pollTimer.stop();
 
-    pluginLoader.reset();
-    g_pluginLoader = nullptr;
+    if (g_showPlaceholderTimer) {
+        g_showPlaceholderTimer->stop();
+    }
+    if (g_timeoutTimer) {
+        g_timeoutTimer->stop();
+    }
 
-    g_pipe = nullptr;
-    g_sessionManager = nullptr;
-    g_engine = nullptr;
-    g_statusProvider = nullptr;
-    g_placeholderWindow = nullptr;
-    g_timeoutTimer = nullptr;
-    g_showPlaceholderTimer = nullptr;
-    pipe.close();
+    if (g_pluginLoader) {
+        g_pluginLoader->reset();
+    }
+
+    if (g_placeholderWindow) {
+        g_placeholderWindow->deleteLater();
+        g_placeholderWindow.clear();
+    }
+
+    g_pipe.reset();
+    g_showPlaceholderTimer.reset();
+    g_timeoutTimer.reset();
+
+    g_sessionManager.clear();
+    g_engine.clear();
+    g_pluginLoader.reset();
+    g_statusProvider.clear();
 
     LOG_INFO("=== GUI exited with code " + std::to_string(result) + " ===");
-    return result;
+    return 0;
 }

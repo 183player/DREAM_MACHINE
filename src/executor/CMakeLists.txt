@@ -5,4 +5,5 @@ target_link_libraries(executor PRIVATE
         dm_logger
         dm_base
         dm_pipe
+        dm_event
 )

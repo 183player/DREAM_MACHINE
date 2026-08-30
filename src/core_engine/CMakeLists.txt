@@ -9,6 +9,7 @@ target_include_directories(core_engine PRIVATE
         ${CMAKE_SOURCE_DIR}/platform/dm_base
         ${CMAKE_SOURCE_DIR}/platform/dm_pipe
         ${CMAKE_SOURCE_DIR}/platform/dm_logger  # 如果需要 logger.h
+        ${CMAKE_SOURCE_DIR}/platform/dm_event
 )
 
 # 链接库
@@ -16,5 +17,6 @@ target_link_libraries(core_engine PRIVATE
         dm_base
         dm_pipe
         dm_logger
+        dm_event
         # 注意：dm_pipe 依赖 Windows 系统库，但无需额外指定
 )

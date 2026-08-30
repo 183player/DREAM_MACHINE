@@ -7,59 +7,19 @@
 #include <limits>
 #include <sddl.h>
 #include <vector>
+#include <algorithm>
 
 #pragma comment(lib, "advapi32.lib")
 
 namespace dream_machine {
 
 // ================================================================
-// RAII 辅助：自动关闭句柄
-// ================================================================
-namespace {
-struct HandleCloser {
-    void operator()(HANDLE h) const {
-        if (h && h != INVALID_HANDLE_VALUE) {
-            CloseHandle(h);
-        }
-    }
-};
-} // namespace
-
-// ================================================================
-// 构造函数 / 析构函数
-// ================================================================
-NamedPipe::~NamedPipe() {
-    close();
-}
-
-NamedPipe::NamedPipe(NamedPipe&& other) noexcept
-    : handle_(other.handle_)
-    , is_server_(other.is_server_)
-    , security_desc_(std::move(other.security_desc_)) {
-    other.handle_ = INVALID_HANDLE_VALUE;
-    other.is_server_ = false;
-}
-
-NamedPipe& NamedPipe::operator=(NamedPipe&& other) noexcept {
-    if (this != &other) {
-        close();
-        handle_ = other.handle_;
-        is_server_ = other.is_server_;
-        security_desc_ = std::move(other.security_desc_);
-        other.handle_ = INVALID_HANDLE_VALUE;
-        other.is_server_ = false;
-    }
-    return *this;
-}
-
-// ================================================================
-// 安全描述符创建（仅当前用户可访问）
+// 安全描述符辅助
 // ================================================================
 SECURITY_ATTRIBUTES* NamedPipe::createSecureSecurityAttributes(
     SECURITY_ATTRIBUTES& sa_out,
     std::unique_ptr<void, decltype(&LocalFree)>& desc_out) {
 
-    // SDDL: 仅交互式用户 (IU) 和本地系统 (SY) 完全访问
     const wchar_t* sddl = L"D:(A;;GA;;;IU)(A;;GA;;;SY)";
 
     PSECURITY_DESCRIPTOR p_sec_desc = nullptr;
@@ -80,12 +40,179 @@ SECURITY_ATTRIBUTES* NamedPipe::createSecureSecurityAttributes(
 }
 
 // ================================================================
+// 构造函数 / 析构函数
+// ================================================================
+
+NamedPipe::NamedPipe() {
+    buffer_.resize(BUFFER_SIZE);
+}
+
+NamedPipe::~NamedPipe() {
+    close();
+}
+
+NamedPipe::NamedPipe(NamedPipe&& other) noexcept
+    : handle_(other.handle_)
+    , is_server_(other.is_server_)
+    , security_desc_(std::move(other.security_desc_))
+    , buffer_(std::move(other.buffer_))
+    , buffer_pos_(other.buffer_pos_)
+    , buffer_valid_(other.buffer_valid_) {
+    other.handle_ = INVALID_HANDLE_VALUE;
+    other.is_server_ = false;
+    other.buffer_pos_ = 0;
+    other.buffer_valid_ = 0;
+}
+
+NamedPipe& NamedPipe::operator=(NamedPipe&& other) noexcept {
+    if (this != &other) {
+        close();
+        handle_ = other.handle_;
+        is_server_ = other.is_server_;
+        security_desc_ = std::move(other.security_desc_);
+        buffer_ = std::move(other.buffer_);
+        buffer_pos_ = other.buffer_pos_;
+        buffer_valid_ = other.buffer_valid_;
+        other.handle_ = INVALID_HANDLE_VALUE;
+        other.is_server_ = false;
+        other.buffer_pos_ = 0;
+        other.buffer_valid_ = 0;
+    }
+    return *this;
+}
+
+// ================================================================
+// 缓冲区管理
+// ================================================================
+
+void NamedPipe::resetBuffer() {
+    buffer_pos_ = 0;
+    buffer_valid_ = 0;
+}
+
+// ================================================================
+// 从缓冲区提取一行
+// ================================================================
+
+bool NamedPipe::extractLineFromBuffer(std::string& out_line) {
+    out_line.clear();
+
+    if (buffer_pos_ >= buffer_valid_) {
+        return false;
+    }
+
+    for (size_t i = buffer_pos_; i < buffer_valid_; ++i) {
+        if (buffer_[i] == '\n') {
+            size_t len = i - buffer_pos_;
+            out_line.assign(buffer_.data() + buffer_pos_, len);
+            buffer_pos_ = i + 1;
+
+            if (buffer_pos_ >= buffer_valid_) {
+                buffer_pos_ = 0;
+                buffer_valid_ = 0;
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ================================================================
+// 填充缓冲区（批量读取）
+// ================================================================
+
+PipeResult NamedPipe::fillBuffer(DWORD timeout_ms) {
+    if (handle_ == INVALID_HANDLE_VALUE) {
+        return PipeResult::PIPE_NOT_CONNECTED;
+    }
+
+    if (isBroken()) {
+        return PipeResult::PIPE_BROKEN;
+    }
+
+    if (buffer_valid_ >= BUFFER_SIZE) {
+        LOG_ERROR("Buffer full without newline, message too large");
+        return PipeResult::PIPE_ERROR;
+    }
+
+    if (buffer_pos_ > 0 && buffer_valid_ > buffer_pos_) {
+        size_t remaining = buffer_valid_ - buffer_pos_;
+        std::memmove(buffer_.data(), buffer_.data() + buffer_pos_, remaining);
+        buffer_valid_ = remaining;
+        buffer_pos_ = 0;
+    } else if (buffer_pos_ > 0) {
+        buffer_pos_ = 0;
+        buffer_valid_ = 0;
+    }
+
+    size_t space_left = BUFFER_SIZE - buffer_valid_;
+    if (space_left == 0) {
+        LOG_ERROR("Buffer full, no newline found");
+        return PipeResult::PIPE_ERROR;
+    }
+
+    DWORD start_time = GetTickCount();
+
+    while (true) {
+        if (GetTickCount() - start_time >= timeout_ms) {
+            return PipeResult::PIPE_TIMEOUT;
+        }
+
+        if (isBroken()) {
+            return PipeResult::PIPE_BROKEN;
+        }
+
+        DWORD bytes_available = 0;
+        if (!PeekNamedPipe(handle_, nullptr, 0, nullptr, &bytes_available, nullptr)) {
+            DWORD err = GetLastError();
+            if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA) {
+                return PipeResult::PIPE_BROKEN;
+            }
+            Sleep(10);
+            continue;
+        }
+
+        if (bytes_available == 0) {
+            Sleep(10);
+            continue;
+        }
+
+        DWORD bytes_to_read = static_cast<DWORD>(std::min<size_t>(bytes_available, space_left));
+        DWORD bytes_read = 0;
+
+        if (!ReadFile(handle_, buffer_.data() + buffer_valid_, bytes_to_read,
+                      &bytes_read, nullptr)) {
+            DWORD err = GetLastError();
+            if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA) {
+                return PipeResult::PIPE_BROKEN;
+            }
+            LOG_ERROR("ReadFile failed: error " + std::to_string(err));
+            return PipeResult::PIPE_ERROR;
+        }
+
+        if (bytes_read > 0) {
+            buffer_valid_ += bytes_read;
+            space_left -= bytes_read;
+            LOG_INFO("Read " + std::to_string(bytes_read) + " bytes into buffer, total: " +
+                     std::to_string(buffer_valid_));
+            return PipeResult::PIPE_OK;
+        }
+
+        Sleep(10);
+    }
+}
+
+// ================================================================
 // 服务端 API
 // ================================================================
+
 bool NamedPipe::createServer(const std::wstring& pipe_name,
                              int max_instances,
                              bool secure) {
     close();
+    resetBuffer();
 
     if (pipe_name.empty() || max_instances < 1) {
         LOG_ERROR("createServer: invalid parameters");
@@ -122,6 +249,7 @@ bool NamedPipe::createServer(const std::wstring& pipe_name,
 
     handle_ = h;
     is_server_ = true;
+    resetBuffer();
 
     std::string name(pipe_name.begin(), pipe_name.end());
     LOG_INFO("Named pipe server created: " + name + " (handle: " +
@@ -135,8 +263,8 @@ PipeResult NamedPipe::waitForClient(DWORD timeout_ms) const {
         return PipeResult::PIPE_NOT_CONNECTED;
     }
 
-    // 使用 if 初始化，采纳 modernize 建议
-    if (BOOL connected = ConnectNamedPipe(handle_, nullptr)) {
+    BOOL connected = ConnectNamedPipe(handle_, nullptr);
+    if (connected) {
         LOG_INFO("Client connected to server pipe");
         return PipeResult::PIPE_OK;
     }
@@ -192,8 +320,10 @@ PipeResult NamedPipe::waitForClient(DWORD timeout_ms) const {
 // ================================================================
 // 客户端 API
 // ================================================================
+
 bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
     close();
+    resetBuffer();
 
     if (pipe_name.empty()) {
         LOG_ERROR("connect: empty pipe name");
@@ -213,6 +343,7 @@ bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
     if (h != INVALID_HANDLE_VALUE) {
         handle_ = h;
         is_server_ = false;
+        resetBuffer();
         std::string name(pipe_name.begin(), pipe_name.end());
         LOG_INFO("Connected to named pipe: " + name);
         return true;
@@ -245,6 +376,7 @@ bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
             if (h != INVALID_HANDLE_VALUE) {
                 handle_ = h;
                 is_server_ = false;
+                resetBuffer();
                 std::string name(pipe_name.begin(), pipe_name.end());
                 LOG_INFO("Connected to named pipe: " + name);
                 return true;
@@ -269,9 +401,6 @@ bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
     }
 }
 
-// ================================================================
-// 连接辅助工具（子进程专用）
-// ================================================================
 bool NamedPipe::connectWithRetry(const std::wstring& pipe_name,
                                  int max_retries,
                                  int delay_ms) {
@@ -288,6 +417,7 @@ bool NamedPipe::connectWithRetry(const std::wstring& pipe_name,
         }
 
         if (connect(pipe_name, 2000)) {
+            resetBuffer();
             return true;
         }
     }
@@ -299,8 +429,9 @@ bool NamedPipe::connectWithRetry(const std::wstring& pipe_name,
 }
 
 // ================================================================
-// 读写 API
+// 写入
 // ================================================================
+
 PipeResult NamedPipe::writeLine(const std::string& message) const {
     if (handle_ == INVALID_HANDLE_VALUE) {
         return PipeResult::PIPE_NOT_CONNECTED;
@@ -327,8 +458,11 @@ PipeResult NamedPipe::writeLine(const std::string& message) const {
     return PipeResult::PIPE_OK;
 }
 
-PipeResult NamedPipe::readLine(std::string& out_message, DWORD timeout_ms) const
-{
+// ================================================================
+// 读取（保留逐字节方式，用于兼容）
+// ================================================================
+
+PipeResult NamedPipe::readLine(std::string& out_message, DWORD timeout_ms) {
     if (handle_ == INVALID_HANDLE_VALUE) {
         return PipeResult::PIPE_NOT_CONNECTED;
     }
@@ -340,20 +474,17 @@ PipeResult NamedPipe::readLine(std::string& out_message, DWORD timeout_ms) const
     return readLineInternal(out_message, timeout_ms);
 }
 
-PipeResult NamedPipe::readLineInternal(std::string& out_message, DWORD timeout_ms) const
-{
+PipeResult NamedPipe::readLineInternal(std::string& out_message, DWORD timeout_ms) {
     out_message.clear();
 
     DWORD start_time = GetTickCount();
     char ch = 0;
 
     while (true) {
-        // 检查超时
         if (GetTickCount() - start_time >= timeout_ms) {
             return PipeResult::PIPE_TIMEOUT;
         }
 
-        // 检查管道是否有数据
         DWORD bytes_available = 0;
         if (!PeekNamedPipe(handle_, nullptr, 0, nullptr, &bytes_available, nullptr)) {
             DWORD err = GetLastError();
@@ -364,7 +495,6 @@ PipeResult NamedPipe::readLineInternal(std::string& out_message, DWORD timeout_m
         }
 
         if (bytes_available == 0) {
-            // 检查管道是否断开
             if (isBroken()) {
                 return PipeResult::PIPE_BROKEN;
             }
@@ -389,13 +519,74 @@ PipeResult NamedPipe::readLineInternal(std::string& out_message, DWORD timeout_m
             out_message.push_back(ch);
         }
 
-        // 防止消息过大
         if (out_message.size() > 1024 * 1024) {
             LOG_ERROR("readLine: message exceeds 1MB limit");
             return PipeResult::PIPE_ERROR;
         }
     }
 }
+
+// ================================================================
+// 缓冲读取（高效接口）
+// ================================================================
+
+PipeResult NamedPipe::readLineBuffered(std::string& out_message, DWORD timeout_ms) {
+    out_message.clear();
+
+    if (handle_ == INVALID_HANDLE_VALUE) {
+        return PipeResult::PIPE_NOT_CONNECTED;
+    }
+
+    if (isBroken()) {
+        return PipeResult::PIPE_BROKEN;
+    }
+
+    if (extractLineFromBuffer(out_message)) {
+        return PipeResult::PIPE_OK;
+    }
+
+    DWORD start_time = GetTickCount();
+
+    while (true) {
+        DWORD elapsed = GetTickCount() - start_time;
+        if (elapsed >= timeout_ms) {
+            return PipeResult::PIPE_TIMEOUT;
+        }
+
+        if (isBroken()) {
+            return PipeResult::PIPE_BROKEN;
+        }
+
+        DWORD remaining = timeout_ms - elapsed;
+        PipeResult fill_result = fillBuffer(remaining);
+
+        if (fill_result == PipeResult::PIPE_BROKEN) {
+            return PipeResult::PIPE_BROKEN;
+        }
+        if (fill_result == PipeResult::PIPE_TIMEOUT) {
+            return PipeResult::PIPE_TIMEOUT;
+        }
+        if (fill_result != PipeResult::PIPE_OK) {
+            Sleep(5);
+            continue;
+        }
+
+        if (extractLineFromBuffer(out_message)) {
+            return PipeResult::PIPE_OK;
+        }
+
+        if (buffer_valid_ >= BUFFER_SIZE) {
+            LOG_ERROR("Buffer full without newline, message too large");
+            return PipeResult::PIPE_ERROR;
+        }
+
+        Sleep(5);
+    }
+}
+
+// ================================================================
+// 其他 API
+// ================================================================
 
 PipeResult NamedPipe::peekAvailable(DWORD& out_bytes) const {
     out_bytes = 0;
@@ -415,9 +606,6 @@ PipeResult NamedPipe::peekAvailable(DWORD& out_bytes) const {
     return PipeResult::PIPE_OK;
 }
 
-// ================================================================
-// 状态检测 API
-// ================================================================
 bool NamedPipe::isValid() const {
     return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr;
 }
@@ -450,10 +638,9 @@ bool NamedPipe::isBroken() const {
     return (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA);
 }
 
-// ================================================================
-// 关闭
-// ================================================================
 void NamedPipe::close() {
+    resetBuffer();
+
     if (handle_ != INVALID_HANDLE_VALUE) {
         std::string msg = "close() closing handle: " +
                           std::to_string(reinterpret_cast<uintptr_t>(handle_));

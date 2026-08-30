@@ -5,6 +5,7 @@
 #include "constants.h"
 #include "plugin_manager.h"
 #include "messages.h"
+#include "error_codes.h"
 
 #include <iostream>
 #include <string>
@@ -14,9 +15,19 @@
 #include <unordered_map>
 #include <mutex>
 #include <iomanip>
+#include <atomic>
 
 using namespace dream_machine;
 using namespace dream_machine::launcher;
+
+// ================================================================
+// 前向声明（解决循环调用问题）
+// ================================================================
+namespace {
+    void handleFullSyncResponse(const std::string& payload);
+    void requestFullSync(NamedPipe& monitor_pipe);
+    void onFullSyncTimer(NamedPipe& monitor_pipe);
+}
 
 // ================================================================
 // 内部辅助（匿名命名空间）
@@ -28,18 +39,19 @@ struct SubprocessInfo {
     std::wstring executable;
 };
 
-// 会话运行状态（内部链接）
 struct SessionState {
     std::string session_id;
-    std::string state;          // "running", "terminated", "crashed"
+    std::string state;
     std::string pipe_name;
     DWORD pid = 0;
+    uint64_t last_update = 0;
 };
 
-// 全局状态
 std::unordered_map<std::string, SessionState> sessions_;
 std::mutex sessions_mutex_;
 std::unique_ptr<PluginManager> g_plugin_manager;
+std::atomic<bool> g_full_sync_in_progress{false};
+uint64_t g_full_sync_sequence = 0;
 
 bool launchSubprocess(const SubprocessInfo& info,
                       std::vector<Process>& managed_processes,
@@ -100,10 +112,8 @@ void pollPipe(NamedPipe& pipe, const std::string& name, bool& out_broken) {
         if (read_result == PipeResult::PIPE_OK) {
             LOG_INFO("[" + name + "] Received: " + message);
 
-            // ---- 解析并处理消息 ----
             std::string type, cmd, payload;
             if (parseBaseMessage(message, type, cmd, payload)) {
-                // 处理插件管理相关命令（来自 gui）
                 if (type == msg_types::PLUGIN_IMPORT) {
                     auto import_msg = parsePluginImport(payload);
                     if (import_msg.has_value()) {
@@ -148,7 +158,9 @@ void pollPipe(NamedPipe& pipe, const std::string& name, bool& out_broken) {
                         pipe.writeLine(resp_json);
                     }
                 }
-                // 其他消息（如会话状态等）由其他模块处理
+                else if (type == msg_types::FULL_SYNC_RESPONSE) {
+                    handleFullSyncResponse(payload);
+                }
             }
 
         } else if (read_result == PipeResult::PIPE_BROKEN) {
@@ -180,74 +192,48 @@ void cleanup(const std::vector<Process>& managed_processes, HANDLE job_handle) {
     LOG_INFO("Cleanup complete");
 }
 
-// 处理 monitor 发来的会话状态变更
-void handleSessionStateChange(const std::string& message, NamedPipe& gui_pipe) {
-    std::string session_id;
-    std::string state;
-    std::string pipe_name;
-
-    size_t id_pos = message.find("\"session_id\"");
-    if (id_pos != std::string::npos) {
-        size_t start = message.find('\"', id_pos + 14);
-        if (start != std::string::npos) {
-            size_t end = message.find('\"', start + 1);
-            if (end != std::string::npos) {
-                session_id = message.substr(start + 1, end - start - 1);
-            }
-        }
-    }
-
-    size_t state_pos = message.find("\"state\"");
-    if (state_pos != std::string::npos) {
-        size_t start = message.find('\"', state_pos + 8);
-        if (start != std::string::npos) {
-            size_t end = message.find('\"', start + 1);
-            if (end != std::string::npos) {
-                state = message.substr(start + 1, end - start - 1);
-            }
-        }
-    }
-
-    size_t pipe_pos = message.find("\"pipe_name\"");
-    if (pipe_pos != std::string::npos) {
-        size_t start = message.find('\"', pipe_pos + 12);
-        if (start != std::string::npos) {
-            size_t end = message.find('\"', start + 1);
-            if (end != std::string::npos) {
-                pipe_name = message.substr(start + 1, end - start - 1);
-            }
-        }
-    }
-
-    if (session_id.empty() || state.empty()) {
-        LOG_WARN("Invalid SESSION_STATE_CHANGED message");
+// ================================================================
+// 会话状态处理
+// ================================================================
+void handleSessionStateChange(const std::string& payload, NamedPipe& gui_pipe) {
+    auto msg = parseSessionStateChanged(payload);
+    if (!msg.has_value()) {
+        LOG_WARN("Failed to parse SESSION_STATE_CHANGED message");
         return;
     }
 
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
-        auto it = sessions_.find(session_id);
+        auto it = sessions_.find(msg->session_id);
         if (it == sessions_.end()) {
             SessionState new_state;
-            new_state.session_id = session_id;
-            new_state.state = state;
-            new_state.pipe_name = pipe_name;
-            sessions_[session_id] = new_state;
+            new_state.session_id = msg->session_id;
+            new_state.state = msg->state;
+            new_state.pipe_name = msg->pipe_name.value_or("");
+            new_state.last_update = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
+            sessions_[msg->session_id] = new_state;
         } else {
-            it->second.state = state;
-            if (!pipe_name.empty()) {
-                it->second.pipe_name = pipe_name;
+            it->second.state = msg->state;
+            if (msg->pipe_name.has_value()) {
+                it->second.pipe_name = *msg->pipe_name;
             }
+            it->second.last_update = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
         }
     }
 
-    LOG_INFO("Session state updated: " + session_id + " -> " + state);
+    LOG_INFO("Session state updated: " + msg->session_id + " -> " + msg->state);
 
     if (gui_pipe.isValid() && gui_pipe.isConnected()) {
-        auto update_msg = SessionStateUpdateMessage{session_id, state};
+        SessionStateUpdateMessage update_msg;
+        update_msg.session_id = msg->session_id;
+        update_msg.state = msg->state;
         std::string gui_msg = serializeSessionStateUpdate(update_msg);
         gui_pipe.writeLine(gui_msg);
-        LOG_INFO("Forwarded session state to gui: " + session_id + " -> " + state);
+        LOG_INFO("Forwarded session state to gui: " + msg->session_id + " -> " + msg->state);
     }
 }
 
@@ -259,6 +245,73 @@ void handleActiveSessionsResp(const std::string& message, NamedPipe& gui_pipe) {
 }
 
 // ================================================================
+// 全量同步机制
+// ================================================================
+
+void requestFullSync(NamedPipe& monitor_pipe) {
+    if (!monitor_pipe.isValid() || !monitor_pipe.isConnected()) {
+        LOG_WARN("Cannot request full sync: monitor pipe not connected");
+        return;
+    }
+
+    if (g_full_sync_in_progress.exchange(true)) {
+        LOG_WARN("Full sync already in progress, skipping");
+        return;
+    }
+
+    ++g_full_sync_sequence;
+    FullSyncRequestMessage req;
+    req.request_id = static_cast<int64_t>(g_full_sync_sequence);
+    std::string req_json = serializeFullSyncRequest(req);
+
+    if (monitor_pipe.writeLine(req_json) == PipeResult::PIPE_OK) {
+        LOG_INFO("Full sync request sent (seq: " + std::to_string(g_full_sync_sequence) + ")");
+    } else {
+        LOG_ERROR("Failed to send full sync request");
+        g_full_sync_in_progress = false;
+    }
+}
+
+void handleFullSyncResponse(const std::string& payload) {
+    auto resp = parseFullSyncResponse(payload);
+    if (!resp.has_value()) {
+        LOG_WARN("Failed to parse FULL_SYNC_RESPONSE");
+        g_full_sync_in_progress = false;
+        return;
+    }
+
+    LOG_INFO("Full sync response received (request_id: " + std::to_string(resp->request_id) +
+             ", sessions: " + std::to_string(resp->sessions.size()) + ")");
+
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        sessions_.clear();
+
+        for (const auto& s : resp->sessions) {
+            SessionState state;
+            state.session_id = s.session_id;
+            state.state = s.state;
+            state.pipe_name = s.pipe_name.value_or("");
+            state.last_update = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
+            sessions_[s.session_id] = state;
+            LOG_INFO("Sync: session " + s.session_id + " -> " + s.state);
+        }
+    }
+
+    g_full_sync_in_progress = false;
+}
+
+void onFullSyncTimer(NamedPipe& monitor_pipe) {
+    if (!monitor_pipe.isValid() || !monitor_pipe.isConnected()) {
+        return;
+    }
+    LOG_INFO("Periodic full sync triggered");
+    requestFullSync(monitor_pipe);
+}
+
+// ================================================================
 // 诊断功能：显示插件信息
 // ================================================================
 int showPluginInfo() {
@@ -266,7 +319,6 @@ int showPluginInfo() {
 
     std::cout << "\n========== Dream Machine Plugin Info ==========\n" << std::endl;
 
-    // 扫描插件
     if (!pm.scanPlugins()) {
         std::cerr << "Failed to scan plugins." << std::endl;
         return 1;
@@ -276,7 +328,6 @@ int showPluginInfo() {
 
     std::cout << "Total plugins: " << manifests.size() << "\n" << std::endl;
 
-    // 系统插件
     auto system_ids = pm.getSystemPluginIds();
     std::cout << "System plugins (" << system_ids.size() << "):" << std::endl;
     for (const auto& id : system_ids) {
@@ -290,7 +341,6 @@ int showPluginInfo() {
         }
     }
 
-    // 用户插件
     auto user_ids = pm.getUserPluginIds();
     std::cout << "\nUser plugins (" << user_ids.size() << "):" << std::endl;
     for (const auto& id : user_ids) {
@@ -304,7 +354,6 @@ int showPluginInfo() {
         }
     }
 
-    // 检查系统插件备份
     std::cout << "\nBackup status: "
               << (PluginManager::hasSystemPluginBackup() ? "available" : "not found")
               << std::endl;
@@ -320,9 +369,6 @@ int showPluginInfo() {
 // main 入口
 // ================================================================
 int main(int argc, char* argv[]) {
-    // ============================================================
-    // 诊断模式：--show-plugin-info
-    // ============================================================
     if (argc > 1 && std::string(argv[1]) == "--show-plugin-info") {
         return showPluginInfo();
     }
@@ -330,40 +376,29 @@ int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("launcher");
     LOG_INFO("=== Dream Machine Launcher starting ===");
 
-    // ============================================================
-    // 初始化插件管理器
-    // ============================================================
     g_plugin_manager = std::make_unique<PluginManager>();
 
-    // 验证系统插件完整性
     if (!g_plugin_manager->verifySystemPlugins()) {
         LOG_WARN("System plugin integrity check failed, continuing anyway");
     }
 
-    // 扫描所有插件
     if (!g_plugin_manager->scanPlugins()) {
         LOG_WARN("Plugin scan failed, continuing without plugins");
     }
 
-    // 生成初始化列表（稍后分发）
     plugin::InitList init_list = g_plugin_manager->generateInitList();
 
     std::vector<Process> managed_processes;
 
-    // ============================================================
-    // 创建 Job Object（含 SILENT_BREAKAWAY_OK）
-    // ============================================================
     HANDLE job_handle = CreateJobObjectW(nullptr, L"Global\\DreamMachine_Launcher_Job");
     if (!job_handle) {
         LOG_ERROR("Failed to create Job Object: error " + std::to_string(GetLastError()));
     } else {
         LOG_INFO("Job Object created successfully");
-
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_info = {};
         job_info.BasicLimitInformation.LimitFlags =
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
             JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
-
         if (!SetInformationJobObject(job_handle, JobObjectExtendedLimitInformation,
                                      &job_info, sizeof(job_info))) {
             LOG_ERROR("Failed to configure Job Object: error " + std::to_string(GetLastError()));
@@ -372,9 +407,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ============================================================
-    // 创建三个管道服务端
-    // ============================================================
     constexpr int MAX_INSTANCES = 1;
 
     std::string monitor_pipe_name_str = pipe_names::launcher_monitor();
@@ -411,9 +443,6 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("All three pipe servers created successfully (secure mode enabled)");
 
-    // ============================================================
-    // 启动子进程
-    // ============================================================
     std::vector<SubprocessInfo> subprocesses;
     subprocesses.push_back({L"monitor", L"monitor.exe"});
     subprocesses.push_back({L"executor", L"executor.exe"});
@@ -431,9 +460,6 @@ int main(int argc, char* argv[]) {
                  "/3 subprocesses started successfully");
     }
 
-    // ============================================================
-    // 等待子进程连接
-    // ============================================================
     LOG_INFO("Waiting for subprocesses to connect...");
 
     int connected_count = 0;
@@ -465,9 +491,6 @@ int main(int argc, char* argv[]) {
         LOG_INFO("All subprocesses connected successfully");
     }
 
-    // ============================================================
-    // 发送初始化列表给所有进程
-    // ============================================================
     if (connected_count == 3) {
         bool dist_ok = g_plugin_manager->distributeInitList(gui_pipe, executor_pipe, monitor_pipe, init_list);
         if (dist_ok) {
@@ -476,20 +499,27 @@ int main(int argc, char* argv[]) {
             LOG_WARN("INIT_LIST distribution incomplete");
         }
 
-        // 向 gui 发送初始会话列表（空，后续由 monitor 推送更新）
-        std::string init_list_msg;
-        init_list_msg += R"({"type":"session_state","cmd":"INIT_SESSION_LIST","payload":{"sessions":[]}})";
+        InitSessionListMessage init_session_msg;
+        std::string init_session_str = serializeInitSessionList(init_session_msg);
         if (gui_pipe.isValid() && gui_pipe.isConnected()) {
-            gui_pipe.writeLine(init_list_msg);
+            gui_pipe.writeLine(init_session_str);
             LOG_INFO("Sent INIT_SESSION_LIST to gui");
         }
     } else {
         LOG_WARN("Not all processes connected, skipping INIT_LIST distribution");
     }
 
-    // ============================================================
-    // 主循环
-    // ============================================================
+    // 全量同步定时器线程
+    std::thread sync_timer([&monitor_pipe]() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+            if (!monitor_pipe.isValid() || !monitor_pipe.isConnected()) {
+                break;
+            }
+            onFullSyncTimer(monitor_pipe);
+        }
+    });
+
     LOG_INFO("Entering main loop...");
 
     while (true) {
@@ -523,16 +553,14 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // ============================================================
-    // 清理
-    // ============================================================
+    sync_timer.join();
+
     monitor_pipe.close();
     executor_pipe.close();
     gui_pipe.close();
 
     cleanup(managed_processes, job_handle);
 
-    // 释放插件管理器
     g_plugin_manager.reset();
 
     LOG_INFO("=== Launcher exited ===");

@@ -1,73 +1,80 @@
 // platform/dm_base/error_codes.h
 #pragma once
 
+#include "constants.h"   // 使用 ErrorCode 和 errorCodeToString
 #include <string>
+#include <cstdint>
 
 namespace dream_machine {
 
-enum class ErrorCode {
-    // 通用
-    OK = 0,
-    UNKNOWN_ERROR,
-
-    // 管道通信
-    PIPE_BROKEN,
-    PIPE_TIMEOUT,
-    PIPE_BUSY,
-    PIPE_NOT_FOUND,
-
-    // 文件操作
-    FILE_NOT_FOUND,
-    FILE_ACCESS_DENIED,
-    FILE_IO_ERROR,
-    FILE_CORRUPTED,
-
-    // L2 写入
-    L2_ERR_MISSING_ANCHOR,
-    L2_ERR_INVALID_STATUS,
-    L2_ERR_WRITE_FAILED,
-
-    // 进程管理
-    PROCESS_LAUNCH_FAILED,
-    PROCESS_TERMINATE_FAILED,
-    PROCESS_NOT_RESPONDING,
-
-    // 插件
-    PLUGIN_MANIFEST_INVALID,
-    PLUGIN_EXTRACT_FAILED,
-    PLUGIN_LOAD_FAILED,
-
-    // 脚本
-    SCRIPT_TIMEOUT,
-    SCRIPT_SYNTAX_ERROR,
-    SCRIPT_RUNTIME_ERROR,
+// ================================================================
+// 错误严重级别
+// ================================================================
+enum class ErrorSeverity : uint8_t {
+    NONE = 0,
+    DEBUG = 1,
+    INFO = 2,
+    WARNING = 3,
+    RECOVERABLE = 4,
+    FATAL = 5,
+    PANIC = 6
 };
 
-inline const char* errorCodeToString(ErrorCode code) {
-    switch (code) {
-        case ErrorCode::OK: return "OK";
-        case ErrorCode::UNKNOWN_ERROR: return "Unknown error";
-        case ErrorCode::PIPE_BROKEN: return "Pipe broken";
-        case ErrorCode::PIPE_TIMEOUT: return "Pipe timeout";
-        case ErrorCode::PIPE_BUSY: return "Pipe busy";
-        case ErrorCode::PIPE_NOT_FOUND: return "Pipe not found";
-        case ErrorCode::FILE_NOT_FOUND: return "File not found";
-        case ErrorCode::FILE_ACCESS_DENIED: return "Access denied";
-        case ErrorCode::FILE_IO_ERROR: return "File I/O error";
-        case ErrorCode::FILE_CORRUPTED: return "File corrupted";
-        case ErrorCode::L2_ERR_MISSING_ANCHOR: return "L2: missing source_anchor";
-        case ErrorCode::L2_ERR_INVALID_STATUS: return "L2: invalid status";
-        case ErrorCode::L2_ERR_WRITE_FAILED: return "L2: write failed";
-        case ErrorCode::PROCESS_LAUNCH_FAILED: return "Process launch failed";
-        case ErrorCode::PROCESS_TERMINATE_FAILED: return "Process terminate failed";
-        case ErrorCode::PROCESS_NOT_RESPONDING: return "Process not responding";
-        case ErrorCode::PLUGIN_MANIFEST_INVALID: return "Plugin manifest invalid";
-        case ErrorCode::PLUGIN_EXTRACT_FAILED: return "Plugin extract failed";
-        case ErrorCode::PLUGIN_LOAD_FAILED: return "Plugin load failed";
-        case ErrorCode::SCRIPT_TIMEOUT: return "Script timeout";
-        case ErrorCode::SCRIPT_SYNTAX_ERROR: return "Script syntax error";
-        case ErrorCode::SCRIPT_RUNTIME_ERROR: return "Script runtime error";
-        default: return "Unknown error code";
+// ================================================================
+// 错误上下文
+// ================================================================
+struct ErrorContext {
+    ErrorCode code = ErrorCode::SUCCESS;
+    ErrorSeverity severity = ErrorSeverity::NONE;
+    std::string message;
+    std::string source;
+    std::string details;
+
+    static ErrorContext ok() {
+        return {ErrorCode::SUCCESS, ErrorSeverity::NONE, "OK", "", ""};
+    }
+
+    static ErrorContext make(ErrorCode code, ErrorSeverity severity,
+                             const std::string& msg,
+                             const std::string& src = "",
+                             const std::string& det = "") {
+        return {code, severity, msg, src, det};
+    }
+
+    [[nodiscard]] bool isSuccess() const {
+        return code == ErrorCode::SUCCESS;
+    }
+
+    [[nodiscard]] bool isFatal() const {
+        return severity == ErrorSeverity::FATAL || severity == ErrorSeverity::PANIC;
+    }
+
+    [[nodiscard]] bool isRecoverable() const {
+        return severity == ErrorSeverity::RECOVERABLE;
+    }
+
+    [[nodiscard]] std::string toString() const {
+        std::string out = "[" + std::to_string(static_cast<int>(code)) + "] ";
+        out += message;
+        if (!source.empty()) out += " (from " + source + ")";
+        if (!details.empty()) out += ": " + details;
+        return out;
+    }
+};
+
+// ================================================================
+// 辅助：将 ErrorSeverity 转为字符串
+// ================================================================
+inline const char* severityToString(ErrorSeverity sev) {
+    switch (sev) {
+        case ErrorSeverity::NONE: return "NONE";
+        case ErrorSeverity::DEBUG: return "DEBUG";
+        case ErrorSeverity::INFO: return "INFO";
+        case ErrorSeverity::WARNING: return "WARNING";
+        case ErrorSeverity::RECOVERABLE: return "RECOVERABLE";
+        case ErrorSeverity::FATAL: return "FATAL";
+        case ErrorSeverity::PANIC: return "PANIC";
+        default: return "UNKNOWN";
     }
 }
 

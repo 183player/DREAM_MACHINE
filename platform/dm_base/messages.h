@@ -6,9 +6,6 @@
 #include <optional>
 #include <cstdint>
 
-// 前向声明（JSON 序列化使用 QJsonObject，但头文件避免过多依赖）
-// 实现在 messages.cpp 中
-
 namespace dream_machine {
 
 // ================================================================
@@ -62,31 +59,38 @@ namespace msg_types {
     inline constexpr const char* RUN_SCRIPT = "RUN_SCRIPT";
     inline constexpr const char* SCRIPT_RESULT = "SCRIPT_RESULT";
 
+    // ---- 会话注册（core_engine ↔ monitor） ----
+    inline constexpr const char* REGISTER_SESSION = "REGISTER_SESSION";
+    inline constexpr const char* UNREGISTER_SESSION = "UNREGISTER_SESSION";
+
+    // ---- 全量同步 ----
+    inline constexpr const char* FULL_SYNC_REQUEST = "FULL_SYNC_REQUEST";
+    inline constexpr const char* FULL_SYNC_RESPONSE = "FULL_SYNC_RESPONSE";
+
     // ---- 命令类型（用于区分） ----
     inline constexpr const char* CMD = "cmd";
     inline constexpr const char* TYPE = "type";
     inline constexpr const char* PAYLOAD = "payload";
-
-} // namespace msg_types
+}
 
 // ================================================================
-// 消息结构体（用于类型安全的序列化/反序列化）
+// 消息结构体
 // ================================================================
 
 // ---- 基础消息 ----
 struct BaseMessage {
-    std::string type;      // msg_types 中的常量
-    std::string cmd;       // 子命令（可选）
-    std::string payload;   // JSON 字符串（或直接存储对象，但保持灵活性）
+    std::string type;
+    std::string cmd;
+    std::string payload;
 };
 
-// ---- 注册消息 ----
+// ---- 注册 ----
 struct RegisterMessage {
-    std::string process;   // "monitor", "executor", "gui", "core_engine"
-    std::optional<std::string> session_id;  // core_engine 注册时提供
+    std::string process;
+    std::optional<std::string> session_id;
 };
 
-// ---- 会话相关 ----
+// ---- 会话管理 ----
 struct RequestEngineMessage {
     std::string session_id;
 };
@@ -98,13 +102,18 @@ struct EngineAssignedMessage {
 
 struct EngineFailedMessage {
     std::string session_id;
-    std::string reason;    // "already_exists", "pipe_create_failed", "launch_failed", "connection_timeout"
+    std::string reason;
 };
 
 struct SessionStateChangedMessage {
     std::string session_id;
-    std::string state;     // "running", "terminated", "crashed"
+    std::string state;
     std::optional<std::string> pipe_name;
+};
+
+struct SessionTerminatedMessage {
+    std::string session_id;
+    std::string reason;
 };
 
 struct SessionStateUpdateMessage {
@@ -112,13 +121,37 @@ struct SessionStateUpdateMessage {
     std::string state;
 };
 
+// ---- 初始化会话列表（新增） ----
+struct InitSessionListMessage {
+    std::vector<SessionStateUpdateMessage> sessions;  // 当前空列表，保留扩展
+};
+
+// ---- 全量同步 ----
+struct FullSyncRequestMessage {
+    int64_t request_id;
+};
+
+struct FullSyncResponseMessage {
+    int64_t request_id;
+    std::vector<SessionStateChangedMessage> sessions;
+};
+
+// ---- 会话注册 ----
+struct RegisterSessionMessage {
+    std::string session_id;
+};
+
+struct UnregisterSessionMessage {
+    std::string session_id;
+};
+
 // ---- 插件相关 ----
 struct InitListMessage {
-    std::string list_json; // 完整初始化列表 JSON 字符串
+    std::string list_json;
 };
 
 struct InitListAckMessage {
-    std::string status;    // "ok" 或 "error"
+    std::string status;
     std::optional<std::string> error;
 };
 
@@ -151,104 +184,143 @@ struct PluginEnableRespMessage {
     std::optional<std::string> error;
 };
 
-// ---- 工具调用（core_engine → executor） ----
+// ---- 工具调用 ----
 struct ToolCallMessage {
-    std::string tool;      // "read_file", "write_file", "delete_file", "list_dir", "atomic_write_l2"
-    std::string params;    // JSON 参数
+    std::string tool;
+    std::string params;
     std::optional<std::string> session_id;
 };
 
 struct StepMessage {
-    std::string cmd;       // "STEP_START", "STEP_OK", "STEP_ERR"
+    std::string cmd;
     std::string description;
-    std::optional<std::string> error;  // 仅 STEP_ERR 时有值
+    std::optional<std::string> error;
 };
 
 struct OpResultMessage {
-    std::string cmd;       // "OP_DONE" 或 "OP_ABORT"
-    std::optional<std::string> result; // 操作结果 JSON
-    std::optional<std::string> error;  // 仅 OP_ABORT 时有值
+    std::string cmd;
+    std::optional<std::string> result;
+    std::optional<std::string> error;
 };
 
 // ---- 脚本执行 ----
 struct RunScriptMessage {
     std::string script_path;
-    std::string params;    // JSON 参数
+    std::string params;
     std::optional<std::string> session_id;
 };
 
 struct ScriptResultMessage {
     bool success;
-    std::optional<std::string> result;  // 脚本返回 JSON
+    std::optional<std::string> result;
     std::optional<std::string> error;
 };
 
 // ---- 错误通知 ----
 struct ErrorNotifyMessage {
-    std::string source;    // 进程名
-    std::string severity;  // "error", "warning", "fatal"
+    std::string source;
+    std::string severity;
     std::string message;
     std::optional<std::string> details;
 };
 
+// ---- 进程控制 ----
+struct ShutdownMessage {
+    std::optional<std::string> session_id;
+};
+
+struct EngineDiedMessage {
+    std::string session_id;
+    std::string reason;
+};
+
 // ================================================================
-// 序列化/反序列化辅助函数（声明）
+// 序列化/反序列化函数声明
 // ================================================================
 
-// 将各种消息结构体转为 JSON 字符串
+// 注册
 std::string serializeRegister(const RegisterMessage& msg);
-std::string serializeRequestEngine(const RequestEngineMessage& msg);
-std::string serializeEngineAssigned(const EngineAssignedMessage& msg);
-std::string serializeEngineFailed(const EngineFailedMessage& msg);
-std::string serializeSessionStateChanged(const SessionStateChangedMessage& msg);
-std::string serializeSessionStateUpdate(const SessionStateUpdateMessage& msg);
-std::string serializeInitList(const InitListMessage& msg);
-std::string serializeInitListAck(const InitListAckMessage& msg);
-std::string serializePluginImport(const PluginImportMessage& msg);
-std::string serializePluginImportResp(const PluginImportRespMessage& msg);
-std::string serializePluginDelete(const PluginDeleteMessage& msg);
-std::string serializePluginDeleteResp(const PluginDeleteRespMessage& msg);
-std::string serializePluginEnable(const PluginEnableMessage& msg);
-std::string serializePluginEnableResp(const PluginEnableRespMessage& msg);
-std::string serializeToolCall(const ToolCallMessage& msg);
-std::string serializeStep(const StepMessage& msg);
-std::string serializeOpResult(const OpResultMessage& msg);
-std::string serializeRunScript(const RunScriptMessage& msg);
-std::string serializeScriptResult(const ScriptResultMessage& msg);
-std::string serializeErrorNotify(const ErrorNotifyMessage& msg);
-
-// 从 JSON 字符串解析（返回 std::optional，失败则为 nullopt）
 std::optional<RegisterMessage> parseRegister(const std::string& json);
+
+// 会话管理
+std::string serializeRequestEngine(const RequestEngineMessage& msg);
 std::optional<RequestEngineMessage> parseRequestEngine(const std::string& json);
+std::string serializeEngineAssigned(const EngineAssignedMessage& msg);
 std::optional<EngineAssignedMessage> parseEngineAssigned(const std::string& json);
+std::string serializeEngineFailed(const EngineFailedMessage& msg);
 std::optional<EngineFailedMessage> parseEngineFailed(const std::string& json);
+std::string serializeSessionStateChanged(const SessionStateChangedMessage& msg);
 std::optional<SessionStateChangedMessage> parseSessionStateChanged(const std::string& json);
+std::string serializeSessionTerminated(const SessionTerminatedMessage& msg);
+std::optional<SessionTerminatedMessage> parseSessionTerminated(const std::string& json);
+std::string serializeSessionStateUpdate(const SessionStateUpdateMessage& msg);
 std::optional<SessionStateUpdateMessage> parseSessionStateUpdate(const std::string& json);
+
+// 初始化会话列表（新增）
+std::string serializeInitSessionList(const InitSessionListMessage& msg);
+std::optional<InitSessionListMessage> parseInitSessionList(const std::string& json);
+
+// 全量同步
+std::string serializeFullSyncRequest(const FullSyncRequestMessage& msg);
+std::optional<FullSyncRequestMessage> parseFullSyncRequest(const std::string& json);
+std::string serializeFullSyncResponse(const FullSyncResponseMessage& msg);
+std::optional<FullSyncResponseMessage> parseFullSyncResponse(const std::string& json);
+
+// 会话注册
+std::string serializeRegisterSession(const RegisterSessionMessage& msg);
+std::optional<RegisterSessionMessage> parseRegisterSession(const std::string& json);
+std::string serializeUnregisterSession(const UnregisterSessionMessage& msg);
+std::optional<UnregisterSessionMessage> parseUnregisterSession(const std::string& json);
+
+// 插件相关
+std::string serializeInitList(const InitListMessage& msg);
 std::optional<InitListMessage> parseInitList(const std::string& json);
+std::string serializeInitListAck(const InitListAckMessage& msg);
 std::optional<InitListAckMessage> parseInitListAck(const std::string& json);
+std::string serializePluginImport(const PluginImportMessage& msg);
 std::optional<PluginImportMessage> parsePluginImport(const std::string& json);
+std::string serializePluginImportResp(const PluginImportRespMessage& msg);
 std::optional<PluginImportRespMessage> parsePluginImportResp(const std::string& json);
+std::string serializePluginDelete(const PluginDeleteMessage& msg);
 std::optional<PluginDeleteMessage> parsePluginDelete(const std::string& json);
+std::string serializePluginDeleteResp(const PluginDeleteRespMessage& msg);
 std::optional<PluginDeleteRespMessage> parsePluginDeleteResp(const std::string& json);
+std::string serializePluginEnable(const PluginEnableMessage& msg);
 std::optional<PluginEnableMessage> parsePluginEnable(const std::string& json);
+std::string serializePluginEnableResp(const PluginEnableRespMessage& msg);
 std::optional<PluginEnableRespMessage> parsePluginEnableResp(const std::string& json);
+
+// 工具调用
+std::string serializeToolCall(const ToolCallMessage& msg);
 std::optional<ToolCallMessage> parseToolCall(const std::string& json);
+std::string serializeStep(const StepMessage& msg);
 std::optional<StepMessage> parseStep(const std::string& json);
+std::string serializeOpResult(const OpResultMessage& msg);
 std::optional<OpResultMessage> parseOpResult(const std::string& json);
+
+// 脚本执行
+std::string serializeRunScript(const RunScriptMessage& msg);
 std::optional<RunScriptMessage> parseRunScript(const std::string& json);
+std::string serializeScriptResult(const ScriptResultMessage& msg);
 std::optional<ScriptResultMessage> parseScriptResult(const std::string& json);
+
+// 错误通知
+std::string serializeErrorNotify(const ErrorNotifyMessage& msg);
 std::optional<ErrorNotifyMessage> parseErrorNotify(const std::string& json);
 
-// ================================================================
-// 辅助函数：构建通用消息
-// ================================================================
+// 进程控制
+std::string serializeShutdown(const ShutdownMessage& msg);
+std::optional<ShutdownMessage> parseShutdown(const std::string& json);
+std::string serializeEngineDied(const EngineDiedMessage& msg);
+std::optional<EngineDiedMessage> parseEngineDied(const std::string& json);
 
-// 构建一个标准消息（包含 type, cmd, payload）
+// ================================================================
+// 通用辅助函数
+// ================================================================
 std::string buildMessage(const std::string& type,
                          const std::string& cmd,
                          const std::string& payload_json);
 
-// 从标准消息中提取 type, cmd, payload
 bool parseBaseMessage(const std::string& json,
                       std::string& out_type,
                       std::string& out_cmd,

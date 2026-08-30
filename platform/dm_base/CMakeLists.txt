@@ -5,6 +5,7 @@ add_library(dm_base STATIC
         plugin_types.cpp
         messages.h
         messages.cpp
+        common_utils.h
 )
 
 target_include_directories(dm_base PUBLIC
