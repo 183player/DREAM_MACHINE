@@ -1,13 +1,13 @@
 // platform/dm_event/event_loop.cpp
 #include "event_loop.h"
-#include "logger.h"          // 添加日志宏支持
+#include "logger.h"
 
 #include <algorithm>
 #include <chrono>
 #include <memory>
 #include <vector>
 
-namespace dream_machine::event {   // 合并嵌套命名空间
+namespace dream_machine::event {
 
 // ================================================================
 // 构造函数 / 析构函数
@@ -133,6 +133,35 @@ EventHandle EventLoop::registerSignal(EventCallback callback, void* user_data) {
 }
 
 // ================================================================
+// 新增：注册通用等待句柄
+// ================================================================
+
+EventHandle EventLoop::registerWaitable(HANDLE handle, EventCallback callback, void* user_data) {
+    EventHandle result{0, false};
+
+    if (!handle || handle == INVALID_HANDLE_VALUE) {
+        LOG_ERROR("EventLoop: invalid handle for waitable event");
+        return result;
+    }
+
+    auto item = std::make_unique<EventItem>();
+    item->kind = EventItem::Kind::WAITABLE;
+    item->handle = handle;          // 直接存储句柄
+    item->callback = std::move(callback);
+    item->user_data = user_data;
+    item->id = next_id_++;
+    item->active = true;
+    // WAITABLE 不需要 signal_event，直接用 handle 本身等待
+
+    uint64_t id = item->id;
+    items_.push_back(std::move(item));
+
+    result.id = id;
+    result.active = true;
+    return result;
+}
+
+// ================================================================
 // 取消注册
 // ================================================================
 
@@ -213,36 +242,49 @@ void EventLoop::updateTimerEvents() {
 
 void EventLoop::processEvents(DWORD timeout_ms) {
     std::vector<HANDLE> wait_handles;
-    std::vector<EventItem*> item_map;
+    std::vector<EventItem*> item_map;      // 与 wait_handles 对应（跳过 stop_event）
 
     wait_handles.push_back(stop_event_);
 
+    // ----- 收集需要等待的句柄 -----
     for (auto& item : items_) {
         if (!item || !item->active) {
             continue;
         }
 
         if (item->kind == EventItem::Kind::READABLE) {
+            // READABLE: 使用 Peek 直接检测，不进入等待循环
             if (isHandleReadable(item->handle)) {
                 if (item->callback) {
                     item->callback(EventType::READABLE, item->user_data);
                 }
             }
+        } else if (item->kind == EventItem::Kind::WAITABLE) {
+            // WAITABLE: 将句柄加入等待列表
+            if (item->handle && item->handle != INVALID_HANDLE_VALUE) {
+                wait_handles.push_back(item->handle);
+                item_map.push_back(item.get());
+            }
         } else if (item->kind == EventItem::Kind::SIGNAL) {
+            // SIGNAL: 使用 signal_event 等待
             if (item->signal_event && item->signal_event != INVALID_HANDLE_VALUE) {
                 wait_handles.push_back(item->signal_event);
                 item_map.push_back(item.get());
             }
         }
+        // TIMER 由 updateTimerEvents 单独处理
     }
 
+    // 更新定时器（不阻塞）
     updateTimerEvents();
 
+    // ----- 如果没有需要等待的句柄，短暂休眠 -----
     if (wait_handles.size() <= 1) {
         Sleep(10);
         return;
     }
 
+    // ----- 等待多个句柄 -----
     DWORD result = WaitForMultipleObjects(
         static_cast<DWORD>(wait_handles.size()),
         wait_handles.data(),
@@ -251,19 +293,26 @@ void EventLoop::processEvents(DWORD timeout_ms) {
     );
 
     if (result == WAIT_OBJECT_0) {
+        // 停止事件被触发
         return;
     }
 
     if (result >= WAIT_OBJECT_0 + 1 && result < WAIT_OBJECT_0 + wait_handles.size()) {
-        size_t index = result - WAIT_OBJECT_0 - 1;
+        // 某个句柄被触发
+        size_t index = result - WAIT_OBJECT_0 - 1;  // 跳过 stop_event
         if (index < item_map.size()) {
             auto* item = item_map[index];
             if (item && item->active && item->callback) {
-                item->callback(EventType::SIGNAL_EVENT, item->user_data);
+                // 判断是 WAITABLE 还是 SIGNAL
+                if (item->kind == EventItem::Kind::WAITABLE) {
+                    item->callback(EventType::WAITABLE, item->user_data);
+                } else if (item->kind == EventItem::Kind::SIGNAL) {
+                    item->callback(EventType::SIGNAL_EVENT, item->user_data);
+                }
             }
         }
     } else if (result == WAIT_TIMEOUT) {
-        // 无事件，继续循环
+        // 超时，无事件
     } else if (result == WAIT_FAILED) {
         DWORD err = GetLastError();
         if (err != ERROR_INVALID_HANDLE) {

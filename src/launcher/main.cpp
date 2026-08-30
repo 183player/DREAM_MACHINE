@@ -6,6 +6,7 @@
 #include "plugin_manager.h"
 #include "messages.h"
 #include "error_codes.h"
+#include "event_loop.h"
 
 #include <iostream>
 #include <string>
@@ -16,17 +17,22 @@
 #include <mutex>
 #include <iomanip>
 #include <atomic>
+#include <memory>
 
 using namespace dream_machine;
 using namespace dream_machine::launcher;
+using namespace dream_machine::event;
 
 // ================================================================
-// 前向声明（解决循环调用问题）
+// 前向声明
 // ================================================================
 namespace {
     void handleFullSyncResponse(const std::string& payload);
-    void requestFullSync(NamedPipe& monitor_pipe);
-    void onFullSyncTimer(NamedPipe& monitor_pipe);
+    void handleSessionStateChange(const std::string& payload, NamedPipe& gui_pipe);
+    void handleActiveSessionsResp(const std::string& message, NamedPipe& gui_pipe);
+    void onProcessExit(EventType type, void* user_data);
+    void onPipeReadable(EventType type, void* user_data);
+    void onHeartbeat(EventType type, void* user_data);
 }
 
 // ================================================================
@@ -47,11 +53,30 @@ struct SessionState {
     uint64_t last_update = 0;
 };
 
+// 全局状态
 std::unordered_map<std::string, SessionState> sessions_;
 std::mutex sessions_mutex_;
 std::unique_ptr<PluginManager> g_plugin_manager;
-std::atomic<bool> g_full_sync_in_progress{false};
-uint64_t g_full_sync_sequence = 0;
+std::atomic<bool> g_shutdown_requested{false};
+
+// 子进程管理
+std::vector<Process> g_managed_processes;
+NamedPipe* g_monitor_pipe = nullptr;
+NamedPipe* g_executor_pipe = nullptr;
+NamedPipe* g_gui_pipe = nullptr;
+
+// 事件循环指针（用于回调中停止）
+EventLoop* g_event_loop = nullptr;
+
+// 用于在回调中访问的上下文
+struct LauncherContext {
+    NamedPipe* monitor_pipe;
+    NamedPipe* executor_pipe;
+    NamedPipe* gui_pipe;
+    std::vector<Process>* processes;
+    std::atomic<bool>* shutdown;
+};
+std::unique_ptr<LauncherContext> g_context;
 
 bool launchSubprocess(const SubprocessInfo& info,
                       std::vector<Process>& managed_processes,
@@ -76,98 +101,6 @@ bool launchSubprocess(const SubprocessInfo& info,
              " (PID: " + std::to_string(managed_processes.back().getPid()) +
              ", attached to Job Object)");
     return true;
-}
-
-void pollPipe(NamedPipe& pipe, const std::string& name, bool& out_broken) {
-    out_broken = false;
-
-    if (!pipe.isValid()) {
-        out_broken = true;
-        return;
-    }
-
-    if (pipe.isBroken()) {
-        LOG_WARN("[" + name + "] Pipe broken (isBroken)");
-        out_broken = true;
-        return;
-    }
-
-    DWORD bytes_available = 0;
-    PipeResult peek_result = pipe.peekAvailable(bytes_available);
-
-    if (peek_result == PipeResult::PIPE_BROKEN) {
-        LOG_WARN("[" + name + "] Pipe broken (peek failed)");
-        out_broken = true;
-        return;
-    }
-
-    if (peek_result != PipeResult::PIPE_OK) {
-        return;
-    }
-
-    if (bytes_available > 0) {
-        std::string message;
-        PipeResult read_result = pipe.readLine(message, 100);
-
-        if (read_result == PipeResult::PIPE_OK) {
-            LOG_INFO("[" + name + "] Received: " + message);
-
-            std::string type, cmd, payload;
-            if (parseBaseMessage(message, type, cmd, payload)) {
-                if (type == msg_types::PLUGIN_IMPORT) {
-                    auto import_msg = parsePluginImport(payload);
-                    if (import_msg.has_value()) {
-                        std::string plugin_id;
-                        bool success = g_plugin_manager->importPlugin(import_msg->package_path, plugin_id);
-                        PluginImportRespMessage resp;
-                        resp.success = success;
-                        if (success) {
-                            resp.plugin_id = plugin_id;
-                            LOG_INFO("Plugin imported: " + plugin_id);
-                        } else {
-                            resp.error = "Import failed";
-                        }
-                        std::string resp_json = serializePluginImportResp(resp);
-                        pipe.writeLine(resp_json);
-                    }
-                }
-                else if (type == msg_types::PLUGIN_DELETE) {
-                    auto delete_msg = parsePluginDelete(payload);
-                    if (delete_msg.has_value()) {
-                        bool success = g_plugin_manager->deletePlugin(delete_msg->plugin_id);
-                        PluginDeleteRespMessage resp;
-                        resp.success = success;
-                        if (!success) {
-                            resp.error = "Delete failed";
-                        }
-                        std::string resp_json = serializePluginDeleteResp(resp);
-                        pipe.writeLine(resp_json);
-                    }
-                }
-                else if (type == msg_types::PLUGIN_ENABLE) {
-                    auto enable_msg = parsePluginEnable(payload);
-                    if (enable_msg.has_value()) {
-                        bool success = g_plugin_manager->setPluginEnabled(enable_msg->plugin_id,
-                                                                         enable_msg->enabled);
-                        PluginEnableRespMessage resp;
-                        resp.success = success;
-                        if (!success) {
-                            resp.error = "Enable/disable failed";
-                        }
-                        std::string resp_json = serializePluginEnableResp(resp);
-                        pipe.writeLine(resp_json);
-                    }
-                }
-                else if (type == msg_types::FULL_SYNC_RESPONSE) {
-                    handleFullSyncResponse(payload);
-                }
-            }
-
-        } else if (read_result == PipeResult::PIPE_BROKEN) {
-            LOG_WARN("[" + name + "] Pipe broken (read failed)");
-            out_broken = true;
-        }
-    }
 }
 
 void cleanup(const std::vector<Process>& managed_processes, HANDLE job_handle) {
@@ -244,39 +177,10 @@ void handleActiveSessionsResp(const std::string& message, NamedPipe& gui_pipe) {
     }
 }
 
-// ================================================================
-// 全量同步机制
-// ================================================================
-
-void requestFullSync(NamedPipe& monitor_pipe) {
-    if (!monitor_pipe.isValid() || !monitor_pipe.isConnected()) {
-        LOG_WARN("Cannot request full sync: monitor pipe not connected");
-        return;
-    }
-
-    if (g_full_sync_in_progress.exchange(true)) {
-        LOG_WARN("Full sync already in progress, skipping");
-        return;
-    }
-
-    ++g_full_sync_sequence;
-    FullSyncRequestMessage req;
-    req.request_id = static_cast<int64_t>(g_full_sync_sequence);
-    std::string req_json = serializeFullSyncRequest(req);
-
-    if (monitor_pipe.writeLine(req_json) == PipeResult::PIPE_OK) {
-        LOG_INFO("Full sync request sent (seq: " + std::to_string(g_full_sync_sequence) + ")");
-    } else {
-        LOG_ERROR("Failed to send full sync request");
-        g_full_sync_in_progress = false;
-    }
-}
-
 void handleFullSyncResponse(const std::string& payload) {
     auto resp = parseFullSyncResponse(payload);
     if (!resp.has_value()) {
         LOG_WARN("Failed to parse FULL_SYNC_RESPONSE");
-        g_full_sync_in_progress = false;
         return;
     }
 
@@ -286,7 +190,6 @@ void handleFullSyncResponse(const std::string& payload) {
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         sessions_.clear();
-
         for (const auto& s : resp->sessions) {
             SessionState state;
             state.session_id = s.session_id;
@@ -299,16 +202,135 @@ void handleFullSyncResponse(const std::string& payload) {
             LOG_INFO("Sync: session " + s.session_id + " -> " + s.state);
         }
     }
-
-    g_full_sync_in_progress = false;
 }
 
-void onFullSyncTimer(NamedPipe& monitor_pipe) {
-    if (!monitor_pipe.isValid() || !monitor_pipe.isConnected()) {
+// ================================================================
+// 事件回调函数
+// ================================================================
+
+// 子进程退出回调
+void onProcessExit(EventType type, void* user_data) {
+    (void)type;
+    Process* proc = static_cast<Process*>(user_data);
+    LOG_INFO("Subprocess (PID: " + std::to_string(proc->getPid()) + ") has exited");
+    g_shutdown_requested = true;
+    if (g_event_loop) {
+        g_event_loop->stop();
+        LOG_INFO("Event loop stop requested from process exit callback");
+    }
+}
+
+// 管道可读回调（处理消息）
+void onPipeReadable(EventType type, void* user_data) {
+    (void)type;
+    if (!user_data || g_shutdown_requested) return;
+
+    NamedPipe* pipe = static_cast<NamedPipe*>(user_data);
+    if (!pipe->isValid() || pipe->isBroken()) {
+        LOG_WARN("Pipe invalid or broken");
+        g_shutdown_requested = true;
+        if (g_event_loop) {
+            g_event_loop->stop();
+            LOG_INFO("Event loop stop requested from pipe broken callback");
+        }
         return;
     }
-    LOG_INFO("Periodic full sync triggered");
-    requestFullSync(monitor_pipe);
+
+    DWORD bytes_available = 0;
+    PipeResult peek_result = pipe->peekAvailable(bytes_available);
+    if (peek_result != PipeResult::PIPE_OK || bytes_available == 0) {
+        return;
+    }
+
+    std::string message;
+    PipeResult read_result = pipe->readLineBuffered(message, 3000);
+    if (read_result == PipeResult::PIPE_OK) {
+        LOG_INFO("Received: " + message);
+
+        std::string type_str, cmd, payload;
+        if (parseBaseMessage(message, type_str, cmd, payload)) {
+            if (type_str == msg_types::PLUGIN_IMPORT) {
+                auto import_msg = parsePluginImport(payload);
+                if (import_msg.has_value()) {
+                    std::string plugin_id;
+                    bool success = g_plugin_manager->importPlugin(import_msg->package_path, plugin_id);
+                    PluginImportRespMessage resp;
+                    resp.success = success;
+                    if (success) {
+                        resp.plugin_id = plugin_id;
+                        LOG_INFO("Plugin imported: " + plugin_id);
+                    } else {
+                        resp.error = "Import failed";
+                    }
+                    std::string resp_json = serializePluginImportResp(resp);
+                    pipe->writeLine(resp_json);
+                }
+            }
+            else if (type_str == msg_types::PLUGIN_DELETE) {
+                auto delete_msg = parsePluginDelete(payload);
+                if (delete_msg.has_value()) {
+                    bool success = g_plugin_manager->deletePlugin(delete_msg->plugin_id);
+                    PluginDeleteRespMessage resp;
+                    resp.success = success;
+                    if (!success) {
+                        resp.error = "Delete failed";
+                    }
+                    std::string resp_json = serializePluginDeleteResp(resp);
+                    pipe->writeLine(resp_json);
+                }
+            }
+            else if (type_str == msg_types::PLUGIN_ENABLE) {
+                auto enable_msg = parsePluginEnable(payload);
+                if (enable_msg.has_value()) {
+                    bool success = g_plugin_manager->setPluginEnabled(enable_msg->plugin_id,
+                                                                     enable_msg->enabled);
+                    PluginEnableRespMessage resp;
+                    resp.success = success;
+                    if (!success) {
+                        resp.error = "Enable/disable failed";
+                    }
+                    std::string resp_json = serializePluginEnableResp(resp);
+                    pipe->writeLine(resp_json);
+                }
+            }
+            else if (type_str == msg_types::FULL_SYNC_RESPONSE) {
+                handleFullSyncResponse(payload);
+            }
+            else if (type_str == msg_types::SESSION_STATE_CHANGED) {
+                if (pipe == g_gui_pipe) {
+                    LOG_WARN("SESSION_STATE_CHANGED should come from monitor, not gui");
+                } else {
+                    handleSessionStateChange(payload, *g_gui_pipe);
+                }
+            }
+            else if (type_str == msg_types::ACTIVE_SESSIONS_RESP) {
+                handleActiveSessionsResp(message, *g_gui_pipe);
+            }
+        } else {
+            LOG_WARN("Failed to parse base message");
+        }
+    } else if (read_result == PipeResult::PIPE_BROKEN) {
+        LOG_WARN("Pipe broken during read");
+        g_shutdown_requested = true;
+        if (g_event_loop) {
+            g_event_loop->stop();
+            LOG_INFO("Event loop stop requested from read broken callback");
+        }
+    }
+}
+
+// 心跳日志（定时回调）
+int g_heartbeat_counter = 0;
+void onHeartbeat(EventType type, void* user_data) {
+    (void)type;
+    (void)user_data;
+
+    ++g_heartbeat_counter;
+    if (g_heartbeat_counter % 100 == 0) {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        LOG_INFO("Launcher heartbeat: " + std::to_string(g_heartbeat_counter) +
+                 " iterations, sessions: " + std::to_string(sessions_.size()));
+    }
 }
 
 // ================================================================
@@ -388,8 +410,6 @@ int main(int argc, char* argv[]) {
 
     plugin::InitList init_list = g_plugin_manager->generateInitList();
 
-    std::vector<Process> managed_processes;
-
     HANDLE job_handle = CreateJobObjectW(nullptr, L"Global\\DreamMachine_Launcher_Job");
     if (!job_handle) {
         LOG_ERROR("Failed to create Job Object: error " + std::to_string(GetLastError()));
@@ -425,19 +445,19 @@ int main(int argc, char* argv[]) {
 
     if (!monitor_pipe.createServer(monitor_pipe_name, MAX_INSTANCES, true)) {
         LOG_ERROR("Failed to create monitor pipe server");
-        cleanup(managed_processes, job_handle);
+        cleanup(g_managed_processes, job_handle);
         return 1;
     }
 
     if (!executor_pipe.createServer(executor_pipe_name, MAX_INSTANCES, true)) {
         LOG_ERROR("Failed to create executor pipe server");
-        cleanup(managed_processes, job_handle);
+        cleanup(g_managed_processes, job_handle);
         return 1;
     }
 
     if (!gui_pipe.createServer(gui_pipe_name, MAX_INSTANCES, true)) {
         LOG_ERROR("Failed to create gui pipe server");
-        cleanup(managed_processes, job_handle);
+        cleanup(g_managed_processes, job_handle);
         return 1;
     }
 
@@ -450,13 +470,13 @@ int main(int argc, char* argv[]) {
 
     DWORD parent_pid = GetCurrentProcessId();
     for (const auto& info : subprocesses) {
-        if (!launchSubprocess(info, managed_processes, job_handle, parent_pid)) {
+        if (!launchSubprocess(info, g_managed_processes, job_handle, parent_pid)) {
             LOG_ERROR("Failed to launch " + std::string(info.name.begin(), info.name.end()));
         }
     }
 
-    if (managed_processes.size() != 3) {
-        LOG_WARN("Only " + std::to_string(managed_processes.size()) +
+    if (g_managed_processes.size() != 3) {
+        LOG_WARN("Only " + std::to_string(g_managed_processes.size()) +
                  "/3 subprocesses started successfully");
     }
 
@@ -509,59 +529,90 @@ int main(int argc, char* argv[]) {
         LOG_WARN("Not all processes connected, skipping INIT_LIST distribution");
     }
 
-    // 全量同步定时器线程
-    std::thread sync_timer([&monitor_pipe]() {
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(60));
-            if (!monitor_pipe.isValid() || !monitor_pipe.isConnected()) {
-                break;
-            }
-            onFullSyncTimer(monitor_pipe);
+    // ----- 保存指针供回调使用 -----
+    g_monitor_pipe = &monitor_pipe;
+    g_executor_pipe = &executor_pipe;
+    g_gui_pipe = &gui_pipe;
+
+    // ----- 创建事件循环 -----
+    EventLoop event_loop;
+    g_event_loop = &event_loop;   // 保存全局指针以便回调中使用
+
+    // 注册子进程退出事件
+    for (auto& proc : g_managed_processes) {
+        EventHandle handle = event_loop.registerWaitable(proc.getHandle(), onProcessExit, &proc);
+        if (!handle.active) {
+            LOG_ERROR("Failed to register waitable for process PID: " + std::to_string(proc.getPid()));
+        } else {
+            LOG_INFO("Registered process waitable for PID: " + std::to_string(proc.getPid()));
         }
-    });
-
-    LOG_INFO("Entering main loop...");
-
-    while (true) {
-        bool monitor_broken = false;
-        bool executor_broken = false;
-        bool gui_broken = false;
-
-        pollPipe(monitor_pipe, "monitor", monitor_broken);
-        pollPipe(executor_pipe, "executor", executor_broken);
-        pollPipe(gui_pipe, "gui", gui_broken);
-
-        if (monitor_broken || executor_broken || gui_broken) {
-            LOG_INFO("A subprocess pipe disconnected, launcher shutting down");
-            break;
-        }
-
-        bool all_alive = true;
-        for (const auto& proc : managed_processes) {
-            if (!proc.isRunning()) {
-                LOG_INFO("Subprocess (PID: " + std::to_string(proc.getPid()) + ") has exited");
-                all_alive = false;
-                break;
-            }
-        }
-
-        if (!all_alive) {
-            LOG_INFO("All subprocesses have exited, launcher shutting down");
-            break;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    sync_timer.join();
+    // 注册管道可读事件
+    EventHandle monitor_handle = event_loop.registerReadable(monitor_pipe.getHandle(), onPipeReadable, &monitor_pipe);
+    if (!monitor_handle.active) {
+        LOG_ERROR("Failed to register readable for monitor pipe");
+    } else {
+        LOG_INFO("Registered readable for monitor pipe");
+    }
 
+    EventHandle executor_handle = event_loop.registerReadable(executor_pipe.getHandle(), onPipeReadable, &executor_pipe);
+    if (!executor_handle.active) {
+        LOG_ERROR("Failed to register readable for executor pipe");
+    } else {
+        LOG_INFO("Registered readable for executor pipe");
+    }
+
+    EventHandle gui_handle = event_loop.registerReadable(gui_pipe.getHandle(), onPipeReadable, &gui_pipe);
+    if (!gui_handle.active) {
+        LOG_ERROR("Failed to register readable for gui pipe");
+    } else {
+        LOG_INFO("Registered readable for gui pipe");
+    }
+
+    // 注册心跳定时器（每 100ms 计数，每 100 次输出日志）
+    EventHandle heartbeat_handle = event_loop.registerTimer(100, onHeartbeat, nullptr, false);
+    if (!heartbeat_handle.active) {
+        LOG_WARN("Failed to register heartbeat timer");
+    }
+
+    // 注册停止信号（用于外部停止）
+    EventHandle stop_signal = event_loop.registerSignal([](EventType type, void* data) {
+        (void)type;
+        (void)data;
+        LOG_INFO("Stop signal received");
+        g_shutdown_requested = true;
+        if (g_event_loop) {
+            g_event_loop->stop();
+        }
+    });
+    if (!stop_signal.active) {
+        LOG_WARN("Failed to register stop signal");
+    }
+
+    LOG_INFO("Entering event-driven main loop...");
+    event_loop.run();
+
+    // ----- 清理 -----
+    LOG_INFO("Shutting down launcher...");
+
+    // 取消注册所有事件
+    event_loop.unregister(monitor_handle);
+    event_loop.unregister(executor_handle);
+    event_loop.unregister(gui_handle);
+    event_loop.unregister(heartbeat_handle);
+    event_loop.unregister(stop_signal);
+
+    // 关闭管道
     monitor_pipe.close();
     executor_pipe.close();
     gui_pipe.close();
 
-    cleanup(managed_processes, job_handle);
+    // 清理子进程
+    cleanup(g_managed_processes, job_handle);
 
     g_plugin_manager.reset();
+    g_event_loop = nullptr;
 
     LOG_INFO("=== Launcher exited ===");
     return 0;

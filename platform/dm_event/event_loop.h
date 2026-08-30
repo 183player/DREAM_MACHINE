@@ -12,13 +12,14 @@ namespace dream_machine {
 namespace event {
 
 // ================================================================
-// 事件类型（避免与 Windows 宏冲突，使用 EVENT_ 前缀）
+// 事件类型
 // ================================================================
 enum class EventType {
-    READABLE,        // 句柄可读
+    READABLE,        // 句柄可读（管道有数据）
     TIMER,           // 定时器到期
-    SIGNAL_EVENT,    // 信号事件（如手动触发）
-    ERROR_EVENT      // 错误
+    SIGNAL_EVENT,    // 手动触发信号
+    ERROR_EVENT,     // 错误
+    WAITABLE         // 通用句柄等待（进程退出、事件等）
 };
 
 // ================================================================
@@ -27,7 +28,7 @@ enum class EventType {
 using EventCallback = std::function<void(EventType type, void* user_data)>;
 
 // ================================================================
-// 事件注册句柄（用于取消注册）
+// 事件注册句柄
 // ================================================================
 struct EventHandle {
     uint64_t id = 0;
@@ -51,24 +52,31 @@ public:
     // ============================================================
 
     // 注册可读事件：当 handle 有数据可读时触发回调
-    // @param handle    Windows 句柄（如命名管道、套接字等）
-    // @param callback  回调函数，参数为事件类型和用户数据
-    // @param user_data 用户数据指针，回调时原样传递
-    // @return          事件句柄，用于取消注册
+    // @param handle    Windows 句柄（如命名管道）
+    // @param callback  回调函数
+    // @param user_data 用户数据
+    // @return          事件句柄
     EventHandle registerReadable(HANDLE handle, EventCallback callback, void* user_data = nullptr);
 
-    // 注册定时器事件：经过 interval 毫秒后触发，可重复触发
+    // 注册定时器事件：经过 interval 毫秒后触发
     // @param interval  间隔时间（毫秒）
     // @param callback  回调函数
     // @param user_data 用户数据
-    // @param oneshot   是否只触发一次（默认 false，重复触发）
+    // @param oneshot   是否只触发一次
     // @return          事件句柄
     EventHandle registerTimer(uint64_t interval, EventCallback callback,
                               void* user_data = nullptr, bool oneshot = false);
 
     // 注册信号事件：手动触发（由外部调用 trigger()）
-    // 用于自定义事件通知
     EventHandle registerSignal(EventCallback callback, void* user_data = nullptr);
+
+    // ----- 新增：注册通用等待句柄（进程句柄、事件句柄等）-----
+    // 当 handle 变为有信号状态时触发回调
+    // @param handle    等待句柄（如进程句柄、事件句柄）
+    // @param callback  回调函数
+    // @param user_data 用户数据
+    // @return          事件句柄
+    EventHandle registerWaitable(HANDLE handle, EventCallback callback, void* user_data = nullptr);
 
     // ============================================================
     // 取消注册
@@ -80,16 +88,9 @@ public:
     // 运行与控制
     // ============================================================
 
-    // 启动事件循环（阻塞，直到 stop() 被调用）
     void run();
-
-    // 停止事件循环（使 run() 返回）
     void stop();
-
-    // 检查是否正在运行
     bool isRunning() const { return running_; }
-
-    // 手动触发信号事件（通过注册时返回的 handle 或事件 ID）
     bool triggerSignal(uint64_t event_id);
 
     // ============================================================
@@ -100,8 +101,8 @@ public:
 private:
     // 内部事件项
     struct EventItem {
-        enum class Kind { READABLE, TIMER, SIGNAL } kind;
-        HANDLE handle = INVALID_HANDLE_VALUE;   // 仅 READABLE 使用
+        enum class Kind { READABLE, TIMER, SIGNAL, WAITABLE } kind;
+        HANDLE handle = INVALID_HANDLE_VALUE;   // 句柄（用于 READABLE 和 WAITABLE）
         EventCallback callback;
         void* user_data = nullptr;
         uint64_t id = 0;
@@ -118,7 +119,7 @@ private:
     std::vector<std::unique_ptr<EventItem>> items_;
     uint64_t next_id_ = 1;
     bool running_ = false;
-    HANDLE stop_event_ = INVALID_HANDLE_VALUE;   // 用于停止循环
+    HANDLE stop_event_ = INVALID_HANDLE_VALUE;
 
     // 内部辅助
     void processEvents(DWORD timeout_ms);
