@@ -19,6 +19,16 @@ using namespace dream_machine::common;
 
 namespace {
 
+// 全局状态
+//
+// 未来重审点（依据 DREAM_MACHINE_CONCURRENCY_MODEL_BOUNDARY 专家裁决 Q4）：
+//   1. 若 core_engine 引入业务内聚线程（如三层漏斗的路由层异步解析），需重审：
+//        - g_executor_pipe / g_monitor_pipe 改为 std::shared_ptr<NamedPipe>
+//        - g_session_id 改为线程安全访问
+//      注：执行路径（executor 调用）即使多线程也难以调试，搁置优先。
+//   2. 阶段 1.5 日志管理将调整 setProcessName 位置：
+//        当前在 main() 首行调用，后续改为先解析 session_id 再设置，
+//        以支持 core_engine_{session_id} 多实例日志命名。
 NamedPipe* g_executor_pipe = nullptr;
 NamedPipe* g_monitor_pipe = nullptr;
 EventLoop* g_event_loop = nullptr;
@@ -66,13 +76,20 @@ void processMonitorMessage(EventType type, void* user_data) {
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
             if (type_str == msg_types::SHUTDOWN) {
+                // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
+                //   - 接收方自行决定退出时机，广播方不强制
+                //   - 记录 reason 用于日志区分（peer_exit / user_close / signal）
+                //   - 即使 payload 解析失败也按默认 reason 处理，避免僵死
                 auto shutdown_msg = parseShutdown(payload);
-                if (shutdown_msg.has_value()) {
-                    LOG_INFO("Received SHUTDOWN from monitor, exiting");
-                    g_should_stop = true;
-                    if (g_event_loop) {
-                        g_event_loop->stop();
-                    }
+                std::string reason = shutdown_msg.has_value()
+                                     ? shutdown_msg->reason
+                                     : std::string(shutdown_reason::PEER_EXIT);
+
+                LOG_INFO("Received SHUTDOWN from monitor, reason=" + reason);
+
+                g_should_stop = true;
+                if (g_event_loop) {
+                    g_event_loop->stop();
                 }
             }
         } else {

@@ -109,6 +109,13 @@ namespace constants {
     constexpr int SCRIPT_EXECUTE_TIMEOUT_MS = 5000;
     constexpr int PIPE_BUFFER_SIZE = 4096;
     constexpr int MAX_SESSIONS = 64;
+
+    // SHUTDOWN 广播后，等待子进程自愿退出的窗口（毫秒）。
+    // 超时后由 launcher 走 cleanup() 强制 terminate。
+    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 专家裁决：
+    //   - 500ms 为上限而非下限，提前退完即提前 cleanup
+    //   - 不重试、不判断退出码、不影响 fail-fast 语义
+    constexpr int SHUTDOWN_GRACE_MS = 500;
 }
 
 // ================================================================

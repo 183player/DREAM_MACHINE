@@ -655,10 +655,22 @@ std::optional<ErrorNotifyMessage> parseErrorNotify(const std::string& json) {
 }
 
 // ---- Shutdown ----
+//
+// 扩展说明（契约 #15）：
+//   reason  / initiator 为受控字符串，非空才写入 JSON，
+//   与同文件的 session_id / pipe_name 风格一致。
+//   解析侧对缺字段给默认空字符串，保证不返回 nullopt。
+//
 std::string serializeShutdown(const ShutdownMessage& msg) {
     QJsonObject obj;
     if (msg.session_id.has_value()) {
         obj["session_id"] = toQString(*msg.session_id);
+    }
+    if (!msg.reason.empty()) {
+        obj["reason"] = toQString(msg.reason);
+    }
+    if (!msg.initiator.empty()) {
+        obj["initiator"] = toQString(msg.initiator);
     }
     QJsonDocument doc(obj);
     std::string payload = doc.toJson(QJsonDocument::Compact).toStdString();
@@ -670,6 +682,8 @@ std::optional<ShutdownMessage> parseShutdown(const std::string& json) {
     if (!parseSimplePayload(json, obj)) return std::nullopt;
     ShutdownMessage msg;
     msg.session_id = optStringFromJson(obj["session_id"]);
+    msg.reason = optStringFromJson(obj["reason"]).value_or("");
+    msg.initiator = optStringFromJson(obj["initiator"]).value_or("");
     return msg;
 }
 

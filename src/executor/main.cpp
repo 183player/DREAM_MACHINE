@@ -22,6 +22,13 @@ using namespace dream_machine::common;
 
 namespace {
 
+// 全局状态
+//
+// 未来重审点（依据 DREAM_MACHINE_CONCURRENCY_MODEL_BOUNDARY 专家裁决 Q4）：
+//   若 executor 未来引入业务内聚线程（如异步脚本执行），需重审：
+//     - g_pipe 改为 std::shared_ptr<NamedPipe>
+//     - g_script_paths 加锁或改线程安全结构
+//   当前单线程事件驱动模型下无需改造。
 NamedPipe* g_pipe = nullptr;
 EventLoop* g_event_loop = nullptr;
 std::atomic<bool> g_should_stop{false};
@@ -98,7 +105,25 @@ void processLauncherMessage(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            if (type_str == msg_types::INIT_LIST) {
+            if (type_str == msg_types::SHUTDOWN) {
+                // ---- SHUTDOWN 分支（必须位于最前） ----
+                // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
+                //   - 接收方自行决定退出时机，广播方不强制
+                //   - 记录 reason 用于日志区分（peer_exit / user_close / signal）
+                //   - 立即停事件循环，不做重试
+                auto shutdown_msg = parseShutdown(payload);
+                std::string reason = shutdown_msg.has_value()
+                                     ? shutdown_msg->reason
+                                     : std::string(shutdown_reason::PEER_EXIT);
+
+                LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason);
+
+                g_should_stop = true;
+                if (g_event_loop) {
+                    g_event_loop->stop();
+                }
+            }
+            else if (type_str == msg_types::INIT_LIST) {
                 handleInitList(payload);
                 InitListAckMessage ack;
                 ack.status = "ok";

@@ -74,6 +74,27 @@ namespace msg_types {
 }
 
 // ================================================================
+// SHUTDOWN 消息受控常量
+//
+// 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 专家裁决：
+//   - reason:    "peer_exit" | "user_close" | "signal"
+//   - initiator: "launcher" | "monitor"
+//
+// 使用方式：接收方只记录不解析时可直接记日志；
+//          需要分支判断时用常量比较，禁止字符串硬编码。
+// ================================================================
+namespace shutdown_reason {
+    inline constexpr const char* PEER_EXIT  = "peer_exit";   // 级联退出（对端进程退出触发）
+    inline constexpr const char* USER_CLOSE = "user_close";  // 用户主动关闭（GUI 关闭按钮）
+    inline constexpr const char* SIGNAL     = "signal";      // 外部信号触发
+}
+
+namespace shutdown_initiator {
+    inline constexpr const char* LAUNCHER = "launcher";  // 由 launcher 发起广播
+    inline constexpr const char* MONITOR  = "monitor";   // 由 monitor 下行转发
+}
+
+// ================================================================
 // 消息结构体
 // ================================================================
 
@@ -225,8 +246,14 @@ struct ErrorNotifyMessage {
 };
 
 // ---- 进程控制 ----
+// ShutdownMessage：进程间 SHUTDOWN 广播
+//   session_id: 可选，标识该 SHUTDOWN 关联的会话（core_engine 侧使用）
+//   reason:     受控于 shutdown_reason 命名空间
+//   initiator:  受控于 shutdown_initiator 命名空间
 struct ShutdownMessage {
     std::optional<std::string> session_id;
+    std::string reason;       // 默认空字符串；使用 shutdown_reason::* 常量
+    std::string initiator;    // 默认空字符串；使用 shutdown_initiator::* 常量
 };
 
 struct EngineDiedMessage {

@@ -36,6 +36,18 @@ using namespace dream_machine::gui;
 using namespace dream_machine::common;
 
 // ================================================================
+// 未来重审点（依据 DREAM_MACHINE_CONCURRENCY_MODEL_BOUNDARY 专家裁决 Q4）：
+//
+//   1. 若 GUI 引入 QJSEngine 工作线程（插件脚本执行），需重审：
+//        - Qt 对象访问必须通过 QMetaObject::invokeMethod 跨线程；
+//        - Logger 的 thread_local channel 保证各线程日志隔离（Q5 已裁决）；
+//        - g_pipe 改 std::shared_ptr<NamedPipe> 保证生命周期；
+//   2. Logger 的 mutex_ 保留（Q5 裁决）——即使引入线程也无需重构 Logger 本身。
+//
+//   当前单线程 Qt 事件循环 + 50ms QTimer 轮询模型下无需改造。
+// ================================================================
+
+// ================================================================
 // 全局状态（使用 unique_ptr / QPointer 管理）
 // ================================================================
 static std::unique_ptr<NamedPipe> g_pipe;
@@ -270,6 +282,16 @@ void handleSessionStateUpdate(const std::string& payload) {
     g_sessionManager->updateSessionState(msg->session_id, msg->state);
 }
 
+// ================================================================
+// 管道轮询（QTimer 50ms 触发）
+//
+// 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决 Q4-Q7：
+//   - Q4: 收到 SHUTDOWN 直接 QApplication::quit()，不弹确认框
+//   - Q5: 日志由 Logger 内部每次写入即 flush（file_stream_ << formatted << std::flush），
+//         本函数无需额外 flush 动作
+//   - Q6: pollTimer 由 QApplication::exec() 返回后的 main() 统一停止
+//   - Q7: readLine(3000) 保持不动（现有实现，不是本次改动范围）
+// ================================================================
 void pollPipe() {
     if (!g_pipe || g_should_stop) {
         QApplication::quit();
@@ -305,7 +327,23 @@ void pollPipe() {
 
             std::string type, cmd, payload;
             if (parseBaseMessage(message, type, cmd, payload)) {
-                if (type == msg_types::INIT_LIST) {
+                if (type == msg_types::SHUTDOWN) {
+                    // ---- SHUTDOWN 分支（必须位于最前） ----
+                    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决 Q4：
+                    //   GUI 收到 SHUTDOWN 后直接 QApplication::quit()，不弹确认框
+                    //   reason 仅用于日志区分，不影响退出行为
+                    auto shutdown_msg = parseShutdown(payload);
+                    std::string reason = shutdown_msg.has_value()
+                                         ? shutdown_msg->reason
+                                         : std::string(shutdown_reason::PEER_EXIT);
+
+                    LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason +
+                             ", quitting GUI");
+
+                    g_should_stop = true;
+                    QApplication::quit();
+                }
+                else if (type == msg_types::INIT_LIST) {
                     handleInitList(payload);
                 } else if (type == msg_types::SESSION_STATE_UPDATE) {
                     handleSessionStateUpdate(payload);

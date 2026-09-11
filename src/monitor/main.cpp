@@ -14,9 +14,10 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <mutex>
-#include <tlhelp32.h>
+#include <memory>
 #include <vector>
 #include <atomic>
+#include <tlhelp32.h>
 
 #include "plugin_types.h"
 
@@ -38,16 +39,21 @@ enum class SessionEndReason {
     CRASHED
 };
 
+// Session 用 shared_ptr 管理生命周期：
+//   - sessions_ 存储 shared_ptr<Session>
+//   - core_pipe 存储 shared_ptr<NamedPipe>
+//   - 广播 SHUTDOWN 时锁内收集 shared_ptr，锁外发送；
+//     即使会话在发送期间被 erase，pipe 对象仍存活至发送完成
 struct Session {
     std::string session_id;
     HANDLE process_handle = nullptr;
     DWORD process_pid = 0;
-    NamedPipe core_pipe;
+    std::shared_ptr<NamedPipe> core_pipe;
     SessionState state = SessionState::CREATING;
     SessionEndReason end_reason = SessionEndReason::NORMAL_SHUTDOWN;
 };
 
-std::unordered_map<std::string, Session> sessions_;
+std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
 std::mutex sessions_mutex_;
 HANDLE g_monitor_job_ = nullptr;
 
@@ -104,26 +110,30 @@ void handleInitList(const std::string& payload, NamedPipe& launcher_pipe) {
 }
 
 // ----- 清理崩溃的会话 -----
+// 调用方须持 sessions_mutex_
 void cleanupCrashedSession(const std::string& session_id, NamedPipe& launcher_pipe) {
     auto it = sessions_.find(session_id);
     if (it == sessions_.end()) {
         return;
     }
 
-    Session& session = it->second;
-    session.state = SessionState::CRASHED;
-    session.end_reason = SessionEndReason::CRASHED;
+    std::shared_ptr<Session> session = it->second;
+    session->state = SessionState::CRASHED;
+    session->end_reason = SessionEndReason::CRASHED;
 
     LOG_WARN("Session " + session_id + " crashed, cleaning up");
-    session.core_pipe.close();
 
-    if (session.process_handle && session.process_handle != INVALID_HANDLE_VALUE) {
-        if (WaitForSingleObject(session.process_handle, 0) == WAIT_TIMEOUT) {
-            TerminateProcess(session.process_handle, 1);
-            WaitForSingleObject(session.process_handle, 1000);
+    if (session->core_pipe) {
+        session->core_pipe->close();
+    }
+
+    if (session->process_handle && session->process_handle != INVALID_HANDLE_VALUE) {
+        if (WaitForSingleObject(session->process_handle, 0) == WAIT_TIMEOUT) {
+            TerminateProcess(session->process_handle, 1);
+            WaitForSingleObject(session->process_handle, 1000);
         }
-        CloseHandle(session.process_handle);
-        session.process_handle = nullptr;
+        CloseHandle(session->process_handle);
+        session->process_handle = nullptr;
     }
 
     sessions_.erase(it);
@@ -136,8 +146,8 @@ bool checkMaxSessionsReached() {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     size_t count = 0;
     for (const auto& pair : sessions_) {
-        if (pair.second.state == SessionState::RUNNING ||
-            pair.second.state == SessionState::CREATING) {
+        if (pair.second->state == SessionState::RUNNING ||
+            pair.second->state == SessionState::CREATING) {
             ++count;
         }
     }
@@ -160,9 +170,9 @@ void handleFullSyncRequest(const std::string& payload, NamedPipe& launcher_pipe)
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         for (const auto& pair : sessions_) {
-            if (pair.second.state == SessionState::RUNNING) {
+            if (pair.second->state == SessionState::RUNNING) {
                 SessionStateChangedMessage s;
-                s.session_id = pair.second.session_id;
+                s.session_id = pair.second->session_id;
                 s.state = "running";
                 resp.sessions.push_back(s);
             }
@@ -175,6 +185,60 @@ void handleFullSyncRequest(const std::string& payload, NamedPipe& launcher_pipe)
     } else {
         LOG_ERROR("Failed to send full sync response");
     }
+}
+
+// ================================================================
+// 下行广播 SHUTDOWN 给所有存活的 core_engine
+//
+// 依据 DREAM_MACHINE_CONCURRENCY_MODEL_BOUNDARY 专家裁决 Q3：
+//   - 锁内收集 shared_ptr<NamedPipe> 列表
+//   - 锁外逐个 writeLine
+//   - 即使会话在发送期间被 erase，pipe 对象仍由 shared_ptr 保活
+//
+// 该设计在单线程下与"锁内一次性 writeLine"行为一致；
+// 未来若 monitor 引入业务内聚线程（Q2 已允许），无需重构。
+//
+// 筛选条件（任务包 1 Q2 裁决）：
+//   状态 ∈ {RUNNING, SHUTTING_DOWN} 且 pipe 有效
+// 写入失败仅 WARN，不重试，不阻塞
+// ================================================================
+void broadcastShutdownToCoreEngines(const std::string& reason) {
+    std::vector<std::shared_ptr<NamedPipe>> targets;
+
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        for (auto& pair : sessions_) {
+            Session& session = *pair.second;
+            if (session.state != SessionState::RUNNING &&
+                session.state != SessionState::SHUTTING_DOWN) {
+                continue;
+            }
+            if (!session.core_pipe || !session.core_pipe->isValid()) {
+                continue;
+            }
+            targets.push_back(session.core_pipe);
+        }
+    }
+
+    LOG_INFO("Broadcasting SHUTDOWN to " + std::to_string(targets.size()) +
+             " core_engine(s), reason=" + reason);
+
+    ShutdownMessage msg;
+    // session_id 可选：广播语义下不指定；接收方按自身 session_id 处理
+    msg.reason = reason;
+    msg.initiator = shutdown_initiator::MONITOR;
+
+    std::string json = serializeShutdown(msg);
+
+    for (auto& pipe : targets) {
+        PipeResult result = pipe->writeLine(json);
+        if (result != PipeResult::PIPE_OK) {
+            LOG_WARN("Failed to send SHUTDOWN to core_engine, result=" +
+                     std::to_string(static_cast<int>(result)));
+        }
+    }
+
+    LOG_INFO("SHUTDOWN broadcast complete");
 }
 
 // ================================================================
@@ -219,7 +283,25 @@ void processLauncherMessage(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            if (type_str == msg_types::INIT_LIST) {
+            if (type_str == msg_types::SHUTDOWN) {
+                // ---- SHUTDOWN 分支（必须位于最前） ----
+                // 流程：解析 → 下行广播 → 停止事件循环
+                auto shutdown_msg = parseShutdown(payload);
+                std::string reason = shutdown_msg.has_value()
+                                     ? shutdown_msg->reason
+                                     : std::string(shutdown_reason::PEER_EXIT);
+
+                LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason);
+
+                // 先向所有 core_engine 下行广播，再停止自身
+                broadcastShutdownToCoreEngines(reason);
+
+                g_should_stop = true;
+                if (g_event_loop) {
+                    g_event_loop->stop();
+                }
+            }
+            else if (type_str == msg_types::INIT_LIST) {
                 handleInitList(payload, launcher_pipe);
             } else if (type_str == msg_types::REQUEST_ENGINE) {
                 LOG_WARN("REQUEST_ENGINE not yet implemented");
@@ -238,9 +320,9 @@ void processLauncherMessage(EventType type, void* user_data) {
                 resp_msg.request_id = 0;
                 std::lock_guard<std::mutex> lock(sessions_mutex_);
                 for (const auto& pair : sessions_) {
-                    if (pair.second.state == SessionState::RUNNING) {
+                    if (pair.second->state == SessionState::RUNNING) {
                         SessionStateChangedMessage s;
-                        s.session_id = pair.second.session_id;
+                        s.session_id = pair.second->session_id;
                         s.state = "running";
                         resp_msg.sessions.push_back(s);
                     }
@@ -278,12 +360,12 @@ void pollCorePipes(EventType type, void* user_data) {
 
     std::vector<std::string> crashed_sessions;
     for (auto& pair : sessions_) {
-        Session& session = pair.second;
+        Session& session = *pair.second;
         if (session.state != SessionState::RUNNING &&
             session.state != SessionState::CREATING) {
             continue;
         }
-        if (session.core_pipe.isBroken()) {
+        if (session.core_pipe && session.core_pipe->isBroken()) {
             LOG_WARN("core_engine pipe broken for session: " + session.session_id);
             crashed_sessions.push_back(session.session_id);
         }
@@ -437,18 +519,22 @@ int main(int argc, char* argv[]) {
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         for (auto& pair : sessions_) {
-            Session& session = pair.second;
-            LOG_INFO("Cleaning up session: " + session.session_id);
-            session.core_pipe.close();
+            std::shared_ptr<Session> session = pair.second;
+            LOG_INFO("Cleaning up session: " + session->session_id);
 
-            if (session.process_handle && session.process_handle != INVALID_HANDLE_VALUE) {
-                if (WaitForSingleObject(session.process_handle, 0) == WAIT_TIMEOUT) {
-                    LOG_INFO("Terminating core_engine (PID: " + std::to_string(session.process_pid) +
-                             ") for session " + session.session_id);
-                    TerminateProcess(session.process_handle, 1);
-                    WaitForSingleObject(session.process_handle, 1000);
+            if (session->core_pipe) {
+                session->core_pipe->close();
+            }
+
+            if (session->process_handle && session->process_handle != INVALID_HANDLE_VALUE) {
+                if (WaitForSingleObject(session->process_handle, 0) == WAIT_TIMEOUT) {
+                    LOG_INFO("Terminating core_engine (PID: " + std::to_string(session->process_pid) +
+                             ") for session " + session->session_id);
+                    TerminateProcess(session->process_handle, 1);
+                    WaitForSingleObject(session->process_handle, 1000);
                 }
-                CloseHandle(session.process_handle);
+                CloseHandle(session->process_handle);
+                session->process_handle = nullptr;
             }
         }
         sessions_.clear();
