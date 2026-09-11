@@ -33,6 +33,7 @@ namespace {
     void onProcessExit(EventType type, void* user_data);
     void onPipeReadable(EventType type, void* user_data);
     void onHeartbeat(EventType type, void* user_data);
+    void requestGracefulShutdown(const std::string& reason);
 }
 
 // ================================================================
@@ -59,8 +60,8 @@ std::mutex sessions_mutex_;
 std::unique_ptr<PluginManager> g_plugin_manager;
 std::atomic<bool> g_shutdown_requested{false};
 
-// 子进程管理
-std::vector<Process> g_managed_processes;
+// 子进程管理（shared_ptr 管理生命周期，为未来业务内聚线程预留）
+std::vector<std::shared_ptr<Process>> g_managed_processes;
 NamedPipe* g_monitor_pipe = nullptr;
 NamedPipe* g_executor_pipe = nullptr;
 NamedPipe* g_gui_pipe = nullptr;
@@ -68,18 +69,23 @@ NamedPipe* g_gui_pipe = nullptr;
 // 事件循环指针（用于回调中停止）
 EventLoop* g_event_loop = nullptr;
 
+// 优雅关闭定时器（500ms 自愿窗口）
+std::atomic<bool> g_grace_timer_started{false};
+EventHandle g_grace_timer_handle{0, false};
+
 // 用于在回调中访问的上下文
+// 注：当前未被实际使用（保留为未来状态收敛的载体，见 F1.5-C3）
 struct LauncherContext {
     NamedPipe* monitor_pipe;
     NamedPipe* executor_pipe;
     NamedPipe* gui_pipe;
-    std::vector<Process>* processes;
+    std::vector<std::shared_ptr<Process>>* processes;
     std::atomic<bool>* shutdown;
 };
 std::unique_ptr<LauncherContext> g_context;
 
 bool launchSubprocess(const SubprocessInfo& info,
-                      std::vector<Process>& managed_processes,
+                      std::vector<std::shared_ptr<Process>>& managed_processes,
                       HANDLE job_handle,
                       DWORD parent_pid) {
     ProcessStartOptions options;
@@ -90,39 +96,115 @@ bool launchSubprocess(const SubprocessInfo& info,
     options.creation_flags = ProcessCreationFlags::PROC_NO_WINDOW;
     options.timeout_ms = 2000;
 
-    Process proc;
-    if (!proc.start(options)) {
+    auto proc = std::make_shared<Process>();
+    if (!proc->start(options)) {
         LOG_ERROR("Failed to launch " + std::string(info.name.begin(), info.name.end()));
         return false;
     }
 
-    managed_processes.push_back(std::move(proc));
+    managed_processes.push_back(proc);
     LOG_INFO("Launched " + std::string(info.name.begin(), info.name.end()) +
-             " (PID: " + std::to_string(managed_processes.back().getPid()) +
+             " (PID: " + std::to_string(proc->getPid()) +
              ", attached to Job Object)");
     return true;
 }
 
-void cleanup(const std::vector<Process>& managed_processes, HANDLE job_handle) {
+void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HANDLE job_handle) {
     LOG_INFO("Shutting down launcher...");
 
     for (const auto& proc : managed_processes) {
-        if (proc.isRunning()) {
-            LOG_INFO("Terminating process (PID: " + std::to_string(proc.getPid()) + ")...");
-            proc.terminate();
+        if (!proc) {
+            continue;
+        }
+        if (proc->isRunning()) {
+            LOG_INFO("Terminating process (PID: " + std::to_string(proc->getPid()) + ")...");
+            proc->terminate();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         } else {
-            LOG_INFO("Process (PID: " + std::to_string(proc.getPid()) + ") already exited");
+            LOG_INFO("Process (PID: " + std::to_string(proc->getPid()) + ") already exited");
         }
     }
 
     if (job_handle && job_handle != INVALID_HANDLE_VALUE) {
         LOG_INFO("Closing Job Object (KILL_ON_JOB_CLOSE will terminate any remaining processes)...");
         CloseHandle(job_handle);
-        job_handle = nullptr;
     }
 
     LOG_INFO("Cleanup complete");
+}
+
+// ================================================================
+// 优雅关闭流程
+//
+// 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
+//   - 向所有存活直接子进程（monitor / executor / gui）广播 SHUTDOWN
+//   - 启动 500ms 一次性定时器（幂等）
+//   - 若所有子进程提前退出，由 onProcessExit 提前 stop
+//
+// 幂等性：g_shutdown_requested.exchange(true) 保证首次进入才执行广播
+// 线程安全：本函数可在 onProcessExit / stop_signal 回调中调用
+//           （当前单线程事件循环；未来引入业务内聚线程时需重审）
+// ================================================================
+void requestGracefulShutdown(const std::string& reason) {
+    if (g_shutdown_requested.exchange(true)) {
+        // 已在关闭流程中，跳过
+        return;
+    }
+
+    LOG_INFO("Graceful shutdown requested, reason=" + reason);
+
+    // ----- 1. 广播 SHUTDOWN 给所有存活直接子进程 -----
+    ShutdownMessage msg;
+    msg.reason = reason;
+    msg.initiator = shutdown_initiator::LAUNCHER;
+    std::string json = serializeShutdown(msg);
+
+    auto broadcast = [&json](NamedPipe* pipe, const char* name) {
+        if (!pipe || !pipe->isValid() || pipe->isBroken()) {
+            LOG_WARN(std::string("Skip SHUTDOWN to ") + name + " (pipe unavailable)");
+            return;
+        }
+        PipeResult result = pipe->writeLine(json);
+        if (result != PipeResult::PIPE_OK) {
+            LOG_WARN(std::string("Failed to send SHUTDOWN to ") + name +
+                     ", result=" + std::to_string(static_cast<int>(result)));
+        } else {
+            LOG_INFO(std::string("SHUTDOWN sent to ") + name);
+        }
+    };
+
+    broadcast(g_monitor_pipe, "monitor");
+    broadcast(g_executor_pipe, "executor");
+    broadcast(g_gui_pipe, "gui");
+
+    // ----- 2. 启动 500ms 一次性定时器（幂等） -----
+    if (!g_grace_timer_started.exchange(true)) {
+        if (g_event_loop) {
+            g_grace_timer_handle = g_event_loop->registerTimer(
+                constants::SHUTDOWN_GRACE_MS,
+                [](EventType, void*) {
+                    LOG_INFO("Grace period expired, forcing shutdown");
+                    if (g_event_loop) {
+                        g_event_loop->stop();
+                    }
+                },
+                nullptr,
+                true  // oneshot
+            );
+            if (!g_grace_timer_handle.active) {
+                LOG_WARN("Failed to register grace timer, falling back to immediate stop");
+                if (g_event_loop) {
+                    g_event_loop->stop();
+                }
+            } else {
+                LOG_INFO("Grace timer started (" +
+                         std::to_string(constants::SHUTDOWN_GRACE_MS) + "ms)");
+            }
+        } else {
+            // 事件循环尚未就绪（极端情况），立即停止
+            LOG_WARN("Event loop not available, immediate shutdown");
+        }
+    }
 }
 
 // ================================================================
@@ -209,14 +291,39 @@ void handleFullSyncResponse(const std::string& payload) {
 // ================================================================
 
 // 子进程退出回调
+//
+// 流程（依据 Q1-Q3 裁决）：
+//   1. 触发优雅关闭（幂等，只有首次真正执行广播）
+//   2. 检查是否所有子进程已退出；若是则立即 stop
 void onProcessExit(EventType type, void* user_data) {
     (void)type;
     Process* proc = static_cast<Process*>(user_data);
+    if (!proc) {
+        return;
+    }
+
     LOG_INFO("Subprocess (PID: " + std::to_string(proc->getPid()) + ") has exited");
-    g_shutdown_requested = true;
-    if (g_event_loop) {
-        g_event_loop->stop();
-        LOG_INFO("Event loop stop requested from process exit callback");
+
+    // 触发优雅关闭（幂等）
+    requestGracefulShutdown(shutdown_reason::PEER_EXIT);
+
+    // 检查是否全部子进程已退出——若是则提前 stop（Q3 裁决）
+    bool all_exited = true;
+    for (const auto& p : g_managed_processes) {
+        if (!p) {
+            continue;
+        }
+        if (p->isRunning()) {
+            all_exited = false;
+            break;
+        }
+    }
+
+    if (all_exited) {
+        LOG_INFO("All subprocesses exited, stopping event loop immediately");
+        if (g_event_loop) {
+            g_event_loop->stop();
+        }
     }
 }
 
@@ -228,11 +335,7 @@ void onPipeReadable(EventType type, void* user_data) {
     NamedPipe* pipe = static_cast<NamedPipe*>(user_data);
     if (!pipe->isValid() || pipe->isBroken()) {
         LOG_WARN("Pipe invalid or broken");
-        g_shutdown_requested = true;
-        if (g_event_loop) {
-            g_event_loop->stop();
-            LOG_INFO("Event loop stop requested from pipe broken callback");
-        }
+        requestGracefulShutdown(shutdown_reason::PEER_EXIT);
         return;
     }
 
@@ -311,11 +414,7 @@ void onPipeReadable(EventType type, void* user_data) {
         }
     } else if (read_result == PipeResult::PIPE_BROKEN) {
         LOG_WARN("Pipe broken during read");
-        g_shutdown_requested = true;
-        if (g_event_loop) {
-            g_event_loop->stop();
-            LOG_INFO("Event loop stop requested from read broken callback");
-        }
+        requestGracefulShutdown(shutdown_reason::PEER_EXIT);
     }
 }
 
@@ -540,11 +639,11 @@ int main(int argc, char* argv[]) {
 
     // 注册子进程退出事件
     for (auto& proc : g_managed_processes) {
-        EventHandle handle = event_loop.registerWaitable(proc.getHandle(), onProcessExit, &proc);
+        EventHandle handle = event_loop.registerWaitable(proc->getHandle(), onProcessExit, proc.get());
         if (!handle.active) {
-            LOG_ERROR("Failed to register waitable for process PID: " + std::to_string(proc.getPid()));
+            LOG_ERROR("Failed to register waitable for process PID: " + std::to_string(proc->getPid()));
         } else {
-            LOG_INFO("Registered process waitable for PID: " + std::to_string(proc.getPid()));
+            LOG_INFO("Registered process waitable for PID: " + std::to_string(proc->getPid()));
         }
     }
 
@@ -581,10 +680,7 @@ int main(int argc, char* argv[]) {
         (void)type;
         (void)data;
         LOG_INFO("Stop signal received");
-        g_shutdown_requested = true;
-        if (g_event_loop) {
-            g_event_loop->stop();
-        }
+        requestGracefulShutdown(shutdown_reason::SIGNAL);
     });
     if (!stop_signal.active) {
         LOG_WARN("Failed to register stop signal");
