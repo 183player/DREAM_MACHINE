@@ -67,11 +67,31 @@ public:
     EventHandle registerTimer(uint64_t interval, EventCallback callback,
                               void* user_data = nullptr, bool oneshot = false);
 
-    // 注册信号事件：手动触发（由外部调用 trigger()）
+    // 注册信号事件：手动触发（由外部调用 triggerSignal()）
+    // @param callback  回调函数
+    // @param user_data 用户数据
+    // @return          事件句柄
     EventHandle registerSignal(EventCallback callback, void* user_data = nullptr);
 
-    // ----- 新增：注册通用等待句柄（进程句柄、事件句柄等）-----
-    // 当 handle 变为有信号状态时触发回调
+    // ----- 注册通用等待句柄（进程句柄、事件句柄等）-----
+    //
+    // 语义：一次性等待
+    //   当 handle 变为 signaled 状态时，触发回调一次，随后该事件自动失效
+    //   （内部 active 置为 false，但对象保留在 items_ 中直至 unregister）。
+    //
+    // 设计原因：
+    //   Windows 进程句柄等 signaled 后不会回退，若事件持续 active，
+    //   会在每轮 processEvents 中反复触发回调（实测约 2ms 一次）。
+    //   因此语义定义为"触发一次即失效"，避免调用方需要自行防抖。
+    //
+    // 使用约束：
+    //   1. 回调中【不得】调用 unregister() 移除自身或其他 WAITABLE 项；
+    //      若需在回调中清理事件，应在回调返回后由外部线程/下一次事件处理。
+    //      （原因：processEvents 的 item_map 持有裸指针，回调中 erase 会悬空。）
+    //   2. 若需"持续等待"语义（如等待多次事件），当前未提供；
+    //      调用方可在回调返回后重新 registerWaitable，或未来新增
+    //      registerWaitablePersistent（未实现，按需添加）。
+    //
     // @param handle    等待句柄（如进程句柄、事件句柄）
     // @param callback  回调函数
     // @param user_data 用户数据
@@ -82,6 +102,10 @@ public:
     // 取消注册
     // ============================================================
 
+    // 取消注册并释放资源
+    // 注意：可在事件循环外调用；若在事件循环回调中调用，需满足以下条件：
+    //   - 不得移除当前正在执行的 WAITABLE / SIGNAL 事件自身；
+    //   - 不得移除同一轮 processEvents 中 item_map 所引用的其他事件。
     bool unregister(EventHandle& handle);
 
     // ============================================================

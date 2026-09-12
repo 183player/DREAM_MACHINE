@@ -109,9 +109,10 @@ bool launchSubprocess(const SubprocessInfo& info,
     return true;
 }
 
+// 强制清理：terminate 所有存活子进程并关闭 Job Object。
+// 调用时机：事件循环退出后、进程结束前。
+// 日志语义：由调用方负责输出"Shutting down launcher..."（避免重复）
 void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HANDLE job_handle) {
-    LOG_INFO("Shutting down launcher...");
-
     for (const auto& proc : managed_processes) {
         if (!proc) {
             continue;
@@ -144,6 +145,12 @@ void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HAN
 // 幂等性：g_shutdown_requested.exchange(true) 保证首次进入才执行广播
 // 线程安全：本函数可在 onProcessExit / stop_signal 回调中调用
 //           （当前单线程事件循环；未来引入业务内聚线程时需重审）
+//
+// 未来重审点（P3-1 / 依据 ISSUE-LAUNCHER-LAST-EXIT-LOG-MISSING）：
+//   最后一个退出进程的 WAITABLE 回调可能未触发（日志少一条）。
+//   修复方案：EventLoop 新增 drainPendingEvents()，
+//   stop 前处理完所有已 signaled 的 WAITABLE 事件。
+//   归入阶段 5（横切打磨），与 C1/C2/C4 同批。
 // ================================================================
 void requestGracefulShutdown(const std::string& reason) {
     if (g_shutdown_requested.exchange(true)) {
@@ -159,9 +166,21 @@ void requestGracefulShutdown(const std::string& reason) {
     msg.initiator = shutdown_initiator::LAUNCHER;
     std::string json = serializeShutdown(msg);
 
+    // 日志级别区分（P2-2）：
+    //   - pipe 空 / 无效  → WARN（编程/状态错误）
+    //   - pipe 断开       → INFO（对端已退出，预期行为）
+    //   - 写入失败        → WARN（管道存在但写入失败，异常）
     auto broadcast = [&json](NamedPipe* pipe, const char* name) {
-        if (!pipe || !pipe->isValid() || pipe->isBroken()) {
-            LOG_WARN(std::string("Skip SHUTDOWN to ") + name + " (pipe unavailable)");
+        if (!pipe) {
+            LOG_WARN(std::string("Skip SHUTDOWN to ") + name + " (null pipe)");
+            return;
+        }
+        if (!pipe->isValid()) {
+            LOG_WARN(std::string("Skip SHUTDOWN to ") + name + " (invalid pipe handle)");
+            return;
+        }
+        if (pipe->isBroken()) {
+            LOG_INFO(std::string("Skip SHUTDOWN to ") + name + " (peer already exited)");
             return;
         }
         PipeResult result = pipe->writeLine(json);
@@ -488,6 +507,13 @@ int showPluginInfo() {
 
 // ================================================================
 // main 入口
+//
+// 日志生命周期（阶段 1.5 P1-5）：
+//   - 启动：setProcessName → archiveLastSessionIfDirty → 开始日志
+//   - 退出：最后一条日志 → markCleanExit → return 0
+//
+// --show-plugin-info 分支与启动失败路径不写 .clean_exit 标记：
+// 它们不是正常会话，不应影响下次启动的归档判断。
 // ================================================================
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--show-plugin-info") {
@@ -495,7 +521,16 @@ int main(int argc, char* argv[]) {
     }
 
     Logger::instance().setProcessName("launcher");
+
+    // 检查上次是否正常退出；异常则把旧日志归档到 logs/crashes/
+    // 必须在任何日志写入之前调用，否则会把本次启动的日志一并归档
+    const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
+
     LOG_INFO("=== Dream Machine Launcher starting ===");
+
+    if (archived_prev) {
+        LOG_INFO("Previous session logs archived to logs/crashes/");
+    }
 
     g_plugin_manager = std::make_unique<PluginManager>();
 
@@ -711,5 +746,9 @@ int main(int argc, char* argv[]) {
     g_event_loop = nullptr;
 
     LOG_INFO("=== Launcher exited ===");
+
+    // 写入正常退出标记；下次启动时 archiveLastSessionIfDirty 会消费它
+    Logger::instance().markCleanExit();
+
     return 0;
 }

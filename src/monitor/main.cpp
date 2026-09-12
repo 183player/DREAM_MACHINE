@@ -397,10 +397,26 @@ void logHeartbeat(EventType type, void* user_data) {
 
 // ================================================================
 // main 入口
+//
+// 日志生命周期（阶段 1.5 P1-5）：
+//   - 启动：setProcessName → archiveLastSessionIfDirty → 开始日志
+//   - 退出：最后一条日志 → markCleanExit → return 0
+//
+// 失败路径（父进程校验、连接、注册、事件注册失败）不写 .clean_exit：
+// 它们不是正常会话，下次启动时应被识别为异常退出并归档。
 // ================================================================
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("monitor");
+
+    // 检查上次是否正常退出；异常则把旧日志归档到 logs/crashes/
+    // 必须在任何日志写入之前调用
+    const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
+
     LOG_INFO("=== Dream Machine Monitor starting ===");
+
+    if (archived_prev) {
+        LOG_INFO("Previous session logs archived to logs/crashes/");
+    }
 
     // 使用 common_utils 解析参数并验证父进程
     std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
@@ -552,5 +568,9 @@ int main(int argc, char* argv[]) {
     g_event_loop = nullptr;
 
     LOG_INFO("=== Monitor exited ===");
+
+    // 写入正常退出标记；下次启动时 archiveLastSessionIfDirty 会消费它
+    Logger::instance().markCleanExit();
+
     return 0;
 }

@@ -26,9 +26,10 @@ namespace {
 //        - g_executor_pipe / g_monitor_pipe 改为 std::shared_ptr<NamedPipe>
 //        - g_session_id 改为线程安全访问
 //      注：执行路径（executor 调用）即使多线程也难以调试，搁置优先。
-//   2. 阶段 1.5 日志管理将调整 setProcessName 位置：
-//        当前在 main() 首行调用，后续改为先解析 session_id 再设置，
-//        以支持 core_engine_{session_id} 多实例日志命名。
+//   2. 日志生命周期（阶段 1.5 P1-5）：
+//        启动时调用 archiveLastSessionIfDirty() 检测上次异常退出；
+//        正常退出前调用 markCleanExit() 写入标记。
+//        本文件已调整 setProcessName 顺序以配合多实例日志命名。
 NamedPipe* g_executor_pipe = nullptr;
 NamedPipe* g_monitor_pipe = nullptr;
 EventLoop* g_event_loop = nullptr;
@@ -173,23 +174,42 @@ void logHeartbeat(EventType type, void* user_data) {
 
 // ================================================================
 // main 入口
+//
+// 顺序调整说明（阶段 1.5 P1-6）：
+//   先解析命令行参数（无日志），再根据 session_id 设置进程名，
+//   然后才开始日志输出。避免早期日志写入 "core_engine.log" 后
+//   切换到 "core_engine_{session}.log" 造成孤立文件。
+//
+// 日志文件名规则：
+//   session_id 有效 → "core_engine_{session_id}.log"
+//   session_id 缺失 → "core_engine.log"（仅在拒绝运行前记录诊断信息）
 // ================================================================
 int main(int argc, char* argv[]) {
-    Logger::instance().setProcessName("core_engine");
-    LOG_INFO("=== Dream Machine Core Engine starting ===");
-
-    // 使用 common_utils 解析参数并验证父进程
+    // ----- 1. 先解析命令行参数（无日志） -----
     std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
     DWORD expected_parent_pid = 0;
     if (!parent_pid_str.empty()) {
         expected_parent_pid = static_cast<DWORD>(std::stoul(parent_pid_str));
     }
 
+    g_session_id = common::getArgValue(argc, argv, "--session-id");
+
+    // ----- 2. 设置进程名 -----
+    if (g_session_id.empty()) {
+        Logger::instance().setProcessName("core_engine");
+    } else {
+        Logger::instance().setProcessName("core_engine_" + g_session_id);
+    }
+
+    // ----- 3. 开始日志输出 -----
+    LOG_INFO("=== Dream Machine Core Engine starting ===");
+
+    // ----- 4. 校验父进程 -----
     if (!common::verifyParentPid(expected_parent_pid)) {
         return 1;
     }
 
-    g_session_id = common::getArgValue(argc, argv, "--session-id");
+    // ----- 5. 校验 session_id -----
     if (g_session_id.empty()) {
         LOG_ERROR("Missing --session-id argument, refusing to run");
         return 1;

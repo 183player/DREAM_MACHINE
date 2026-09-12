@@ -133,7 +133,13 @@ EventHandle EventLoop::registerSignal(EventCallback callback, void* user_data) {
 }
 
 // ================================================================
-// 新增：注册通用等待句柄
+// 注册通用等待句柄
+//
+// 语义：句柄 signaled 时触发回调一次，然后该事件自动失效。
+//   - WAITABLE 用于等待"一次性"事件（如进程退出），句柄 signaled
+//     后不会回退，因此事件在首次触发后自动 active = false。
+//   - 如需"持续等待"语义（例如等待多次事件），当前无调用方需求；
+//     若未来需要，可新增 registerWaitablePersistent 或由调用方重新注册。
 // ================================================================
 
 EventHandle EventLoop::registerWaitable(HANDLE handle, EventCallback callback, void* user_data) {
@@ -305,8 +311,16 @@ void EventLoop::processEvents(DWORD timeout_ms) {
             if (item && item->active && item->callback) {
                 // 判断是 WAITABLE 还是 SIGNAL
                 if (item->kind == EventItem::Kind::WAITABLE) {
+                    // WAITABLE 语义：触发一次后自动失效
+                    // 原因：进程句柄等 signaled 后不会回退，若不置为失效
+                    //       会在每轮 processEvents 中反复触发回调。
+                    // 注：不立即 erase，避免 item_map 中其他指针悬空；
+                    //     死对象由后续 unregister 清理，或长期驻留但无害
+                    //     （下一轮收集时被 active 检查跳过）。
+                    item->active = false;
                     item->callback(EventType::WAITABLE, item->user_data);
                 } else if (item->kind == EventItem::Kind::SIGNAL) {
+                    // SIGNAL 使用 auto-reset 事件，不会持续触发，无需额外处理
                     item->callback(EventType::SIGNAL_EVENT, item->user_data);
                 }
             }
