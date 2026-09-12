@@ -5,8 +5,10 @@
 #include "constants.h"
 #include "plugin_manager.h"
 #include "messages.h"
+#include "message_router.h"
 #include "error_codes.h"
 #include "event_loop.h"
+#include "common_utils.h"
 
 #include <iostream>
 #include <string>
@@ -22,6 +24,8 @@
 using namespace dream_machine;
 using namespace dream_machine::launcher;
 using namespace dream_machine::event;
+// 注：阶段 1.7 C4 起不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
 
 // ================================================================
 // 前向声明
@@ -34,6 +38,7 @@ namespace {
     void onPipeReadable(EventType type, void* user_data);
     void onHeartbeat(EventType type, void* user_data);
     void requestGracefulShutdown(const std::string& reason);
+    void registerMessageHandlers(MessageRouter& router);
 }
 
 // ================================================================
@@ -73,6 +78,20 @@ EventLoop* g_event_loop = nullptr;
 std::atomic<bool> g_grace_timer_started{false};
 EventHandle g_grace_timer_handle{0, false};
 
+// 诊断：Job 句柄信息仅记录一次
+bool g_job_info_logged = false;
+
+// 消息分发表（阶段 1.7 C1）
+//
+// 迁移了 5 个 handler（PLUGIN_IMPORT / PLUGIN_DELETE / PLUGIN_ENABLE /
+// FULL_SYNC_RESPONSE / SESSION_STATE_CHANGED）。
+// ACTIVE_SESSIONS_RESP 未迁移——它需要完整 message 字符串（转发给 gui），
+// handler 签名只接收 payload，故保留在原 if-else fallback 中。
+//
+// 回退方式：删除本变量 + registerMessageHandlers 调用，
+//          并将 onPipeReadable 恢复为原始 if-else 即可。
+MessageRouter g_message_router;
+
 // 用于在回调中访问的上下文
 // 注：当前未被实际使用（保留为未来状态收敛的载体，见 F1.5-C3）
 struct LauncherContext {
@@ -84,10 +103,93 @@ struct LauncherContext {
 };
 std::unique_ptr<LauncherContext> g_context;
 
+// ================================================================
+// 诊断辅助：查询 Job Object 内当前进程数
+//
+// 用于 cleanup() 关闭 Job 前确认残留情况。
+// 失败时返回 -1（不影响主流程）。
+//
+// 依据：阶段 1.6 诊断增强 D1
+//
+// 错误码说明（阶段 1.6 修复）：
+//   QueryInformationJobObject 在 buffer=NULL 时返回
+//   ERROR_BAD_LENGTH(24)，而非 ERROR_MORE_DATA(234)。
+//   实测日志出现 "size query failed: 24" 即此原因。
+//   修复：同时接受 ERROR_BAD_LENGTH 与 ERROR_MORE_DATA
+//        （旧版 Windows 可能返回后者）。
+// ================================================================
+int queryJobProcessCount(HANDLE job_handle) {
+    if (!job_handle || job_handle == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    // 第一次调用：查询所需 buffer 大小
+    DWORD bytes_needed = 0;
+    if (!QueryInformationJobObject(job_handle, JobObjectBasicProcessIdList,
+                                    nullptr, 0, &bytes_needed)) {
+        DWORD err = GetLastError();
+        // ERROR_BAD_LENGTH：buffer 为 NULL 时的正常返回值（需更多空间）
+        // ERROR_MORE_DATA：buffer 不足时的返回值（旧 Windows）
+        if (err != ERROR_BAD_LENGTH && err != ERROR_MORE_DATA) {
+            LOG_WARN("QueryInformationJobObject size query failed: " +
+                     std::to_string(err));
+            return -1;
+        }
+    }
+
+    // bytes_needed == 0 表示 Job 中无进程
+    if (bytes_needed == 0) {
+        return 0;
+    }
+
+    // 第二次调用：获取实际数据
+    std::vector<char> buffer(bytes_needed);
+    if (!QueryInformationJobObject(job_handle, JobObjectBasicProcessIdList,
+                                    buffer.data(), bytes_needed, &bytes_needed)) {
+        DWORD err = GetLastError();
+        LOG_WARN("QueryInformationJobObject data query failed: " +
+                 std::to_string(err));
+        return -1;
+    }
+
+    auto* info = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(buffer.data());
+    return static_cast<int>(info->NumberOfProcessIdsInList);
+}
+
+// ================================================================
+// 诊断辅助：Job 句柄继承性检查（仅记录一次）
+//
+// 依据：阶段 1.6 诊断增强 D2
+// ================================================================
+void logJobHandleInfoOnce(HANDLE job_handle) {
+    if (g_job_info_logged) {
+        return;
+    }
+    g_job_info_logged = true;
+
+    if (!job_handle || job_handle == INVALID_HANDLE_VALUE) {
+        LOG_WARN("Job handle is invalid, cannot check inheritable flag");
+        return;
+    }
+
+    DWORD flags = 0;
+    if (GetHandleInformation(job_handle, &flags)) {
+        const bool inheritable = (flags & HANDLE_FLAG_INHERIT) != 0;
+        LOG_INFO(std::string("Job handle inheritable: ") +
+                 (inheritable ? "yes (WARNING: could leak to children)" : "no"));
+    } else {
+        LOG_WARN("GetHandleInformation on Job handle failed: " +
+                 std::to_string(GetLastError()));
+    }
+}
+
 bool launchSubprocess(const SubprocessInfo& info,
                       std::vector<std::shared_ptr<Process>>& managed_processes,
                       HANDLE job_handle,
                       DWORD parent_pid) {
+    // 诊断：首次启动子进程时记录 Job 句柄信息
+    logJobHandleInfoOnce(job_handle);
+
     ProcessStartOptions options;
     options.executable = info.executable;
     options.args = L"--parent-pid " + std::to_wstring(parent_pid);
@@ -98,26 +200,35 @@ bool launchSubprocess(const SubprocessInfo& info,
 
     auto proc = std::make_shared<Process>();
     if (!proc->start(options)) {
-        LOG_ERROR("Failed to launch " + std::string(info.name.begin(), info.name.end()));
+        LOG_ERROR("Failed to launch " + common::wideToUtf8(info.name));
         return false;
     }
 
     managed_processes.push_back(proc);
-    LOG_INFO("Launched " + std::string(info.name.begin(), info.name.end()) +
+    LOG_INFO("Launched " + common::wideToUtf8(info.name) +
              " (PID: " + std::to_string(proc->getPid()) +
              ", attached to Job Object)");
     return true;
 }
 
-// 强制清理：terminate 所有存活子进程并关闭 Job Object。
-// 调用时机：事件循环退出后、进程结束前。
-// 日志语义：由调用方负责输出"Shutting down launcher..."（避免重复）
+// ================================================================
+// 强制清理：terminate 所有存活子进程并关闭 Job Object
+//
+// 依据阶段 1.6 诊断增强 D4：
+//   - 每个进程 terminate 前记录 isRunning 状态
+//   - Job 关闭前记录剩余进程数
+// ================================================================
 void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HANDLE job_handle) {
     for (const auto& proc : managed_processes) {
         if (!proc) {
             continue;
         }
-        if (proc->isRunning()) {
+
+        const bool was_running = proc->isRunning();
+        LOG_INFO("Cleanup check: PID=" + std::to_string(proc->getPid()) +
+                 " isRunning=" + (was_running ? "true" : "false"));
+
+        if (was_running) {
             LOG_INFO("Terminating process (PID: " + std::to_string(proc->getPid()) + ")...");
             proc->terminate();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -127,6 +238,14 @@ void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HAN
     }
 
     if (job_handle && job_handle != INVALID_HANDLE_VALUE) {
+        const int remaining = queryJobProcessCount(job_handle);
+        if (remaining >= 0) {
+            LOG_INFO("Job Object contains " + std::to_string(remaining) +
+                     " process(es) before close");
+        } else {
+            LOG_WARN("Failed to query Job Object process count");
+        }
+
         LOG_INFO("Closing Job Object (KILL_ON_JOB_CLOSE will terminate any remaining processes)...");
         CloseHandle(job_handle);
     }
@@ -154,7 +273,6 @@ void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HAN
 // ================================================================
 void requestGracefulShutdown(const std::string& reason) {
     if (g_shutdown_requested.exchange(true)) {
-        // 已在关闭流程中，跳过
         return;
     }
 
@@ -166,10 +284,6 @@ void requestGracefulShutdown(const std::string& reason) {
     msg.initiator = shutdown_initiator::LAUNCHER;
     std::string json = serializeShutdown(msg);
 
-    // 日志级别区分（P2-2）：
-    //   - pipe 空 / 无效  → WARN（编程/状态错误）
-    //   - pipe 断开       → INFO（对端已退出，预期行为）
-    //   - 写入失败        → WARN（管道存在但写入失败，异常）
     auto broadcast = [&json](NamedPipe* pipe, const char* name) {
         if (!pipe) {
             LOG_WARN(std::string("Skip SHUTDOWN to ") + name + " (null pipe)");
@@ -208,7 +322,7 @@ void requestGracefulShutdown(const std::string& reason) {
                     }
                 },
                 nullptr,
-                true  // oneshot
+                true
             );
             if (!g_grace_timer_handle.active) {
                 LOG_WARN("Failed to register grace timer, falling back to immediate stop");
@@ -220,7 +334,6 @@ void requestGracefulShutdown(const std::string& reason) {
                          std::to_string(constants::SHUTDOWN_GRACE_MS) + "ms)");
             }
         } else {
-            // 事件循环尚未就绪（极端情况），立即停止
             LOG_WARN("Event loop not available, immediate shutdown");
         }
     }
@@ -306,14 +419,106 @@ void handleFullSyncResponse(const std::string& payload) {
 }
 
 // ================================================================
+// 消息 handler 注册（阶段 1.7 C1）
+//
+// 注册 5 个 handler 到全局 router。handler 通过 context (void*)
+// 接收消息来源的 NamedPipe*。
+//
+// 未迁移：ACTIVE_SESSIONS_RESP（需完整 message 字符串，见 router 注释）。
+// ================================================================
+void registerMessageHandlers(MessageRouter& router) {
+    // ---- PLUGIN_IMPORT ----
+    router.register_handler(msg_types::PLUGIN_IMPORT,
+        [](const std::string& payload, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (!pipe) return;
+
+            auto import_msg = parsePluginImport(payload);
+            if (!import_msg.has_value()) return;
+
+            std::string plugin_id;
+            bool success = g_plugin_manager->importPlugin(import_msg->package_path, plugin_id);
+            PluginImportRespMessage resp;
+            resp.success = success;
+            if (success) {
+                resp.plugin_id = plugin_id;
+                LOG_INFO("Plugin imported: " + plugin_id);
+            } else {
+                resp.error = "Import failed";
+            }
+            std::string resp_json = serializePluginImportResp(resp);
+            pipe->writeLine(resp_json);
+        });
+
+    // ---- PLUGIN_DELETE ----
+    router.register_handler(msg_types::PLUGIN_DELETE,
+        [](const std::string& payload, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (!pipe) return;
+
+            auto delete_msg = parsePluginDelete(payload);
+            if (!delete_msg.has_value()) return;
+
+            bool success = g_plugin_manager->deletePlugin(delete_msg->plugin_id);
+            PluginDeleteRespMessage resp;
+            resp.success = success;
+            if (!success) {
+                resp.error = "Delete failed";
+            }
+            std::string resp_json = serializePluginDeleteResp(resp);
+            pipe->writeLine(resp_json);
+        });
+
+    // ---- PLUGIN_ENABLE ----
+    router.register_handler(msg_types::PLUGIN_ENABLE,
+        [](const std::string& payload, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (!pipe) return;
+
+            auto enable_msg = parsePluginEnable(payload);
+            if (!enable_msg.has_value()) return;
+
+            bool success = g_plugin_manager->setPluginEnabled(enable_msg->plugin_id,
+                                                             enable_msg->enabled);
+            PluginEnableRespMessage resp;
+            resp.success = success;
+            if (!success) {
+                resp.error = "Enable/disable failed";
+            }
+            std::string resp_json = serializePluginEnableResp(resp);
+            pipe->writeLine(resp_json);
+        });
+
+    // ---- FULL_SYNC_RESPONSE ----
+    router.register_handler(msg_types::FULL_SYNC_RESPONSE,
+        [](const std::string& payload, void* /*ctx*/) {
+            handleFullSyncResponse(payload);
+        });
+
+    // ---- SESSION_STATE_CHANGED ----
+    // 消息来源应为 monitor；若来自 gui 则为异常。
+    router.register_handler(msg_types::SESSION_STATE_CHANGED,
+        [](const std::string& payload, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (pipe == g_gui_pipe) {
+                LOG_WARN("SESSION_STATE_CHANGED should come from monitor, not gui");
+            } else {
+                if (g_gui_pipe) {
+                    handleSessionStateChange(payload, *g_gui_pipe);
+                }
+            }
+        });
+}
+
+// ================================================================
 // 事件回调函数
 // ================================================================
 
 // 子进程退出回调
 //
-// 流程（依据 Q1-Q3 裁决）：
-//   1. 触发优雅关闭（幂等，只有首次真正执行广播）
-//   2. 检查是否所有子进程已退出；若是则立即 stop
+// 依据阶段 1.6 诊断增强 D3：
+//   记录 all_exited 判断时的完整进程状态快照，
+//   便于定位"提前 stop 但最后进程日志缺失"的场景。
 void onProcessExit(EventType type, void* user_data) {
     (void)type;
     Process* proc = static_cast<Process*>(user_data);
@@ -323,30 +528,39 @@ void onProcessExit(EventType type, void* user_data) {
 
     LOG_INFO("Subprocess (PID: " + std::to_string(proc->getPid()) + ") has exited");
 
-    // 触发优雅关闭（幂等）
-    requestGracefulShutdown(shutdown_reason::PEER_EXIT);
-
-    // 检查是否全部子进程已退出——若是则提前 stop（Q3 裁决）
-    bool all_exited = true;
-    for (const auto& p : g_managed_processes) {
-        if (!p) {
-            continue;
+    // 诊断 D3：记录所有子进程状态快照
+    {
+        std::string snapshot = "Process snapshot:";
+        bool all_exited = true;
+        for (const auto& p : g_managed_processes) {
+            if (!p) {
+                continue;
+            }
+            const bool running = p->isRunning();
+            snapshot += " PID=" + std::to_string(p->getPid()) +
+                        "=" + (running ? "R" : "X");
+            if (running) {
+                all_exited = false;
+            }
         }
-        if (p->isRunning()) {
-            all_exited = false;
-            break;
-        }
-    }
+        snapshot += ", all_exited=" + std::string(all_exited ? "true" : "false");
+        LOG_INFO(snapshot);
 
-    if (all_exited) {
-        LOG_INFO("All subprocesses exited, stopping event loop immediately");
-        if (g_event_loop) {
-            g_event_loop->stop();
+        // 触发优雅关闭（幂等）
+        requestGracefulShutdown(shutdown_reason::PEER_EXIT);
+
+        if (all_exited) {
+            LOG_INFO("All subprocesses exited, stopping event loop immediately");
+            if (g_event_loop) {
+                g_event_loop->stop();
+            }
         }
     }
 }
 
 // 管道可读回调（处理消息）
+//
+// 阶段 1.7 C1：优先走 MessageRouter，未注册的走 fallback（ACTIVE_SESSIONS_RESP）。
 void onPipeReadable(EventType type, void* user_data) {
     (void)type;
     if (!user_data || g_shutdown_requested) return;
@@ -371,62 +585,19 @@ void onPipeReadable(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            if (type_str == msg_types::PLUGIN_IMPORT) {
-                auto import_msg = parsePluginImport(payload);
-                if (import_msg.has_value()) {
-                    std::string plugin_id;
-                    bool success = g_plugin_manager->importPlugin(import_msg->package_path, plugin_id);
-                    PluginImportRespMessage resp;
-                    resp.success = success;
-                    if (success) {
-                        resp.plugin_id = plugin_id;
-                        LOG_INFO("Plugin imported: " + plugin_id);
-                    } else {
-                        resp.error = "Import failed";
-                    }
-                    std::string resp_json = serializePluginImportResp(resp);
-                    pipe->writeLine(resp_json);
+            // ---- 优先走分发表（阶段 1.7 C1） ----
+            if (g_message_router.dispatch(type_str, payload, pipe)) {
+                return;
+            }
+
+            // ---- fallback：未迁移的消息类型 ----
+            // 当前仅 ACTIVE_SESSIONS_RESP（需完整 message 转发给 gui）
+            if (type_str == msg_types::ACTIVE_SESSIONS_RESP) {
+                if (g_gui_pipe) {
+                    handleActiveSessionsResp(message, *g_gui_pipe);
                 }
-            }
-            else if (type_str == msg_types::PLUGIN_DELETE) {
-                auto delete_msg = parsePluginDelete(payload);
-                if (delete_msg.has_value()) {
-                    bool success = g_plugin_manager->deletePlugin(delete_msg->plugin_id);
-                    PluginDeleteRespMessage resp;
-                    resp.success = success;
-                    if (!success) {
-                        resp.error = "Delete failed";
-                    }
-                    std::string resp_json = serializePluginDeleteResp(resp);
-                    pipe->writeLine(resp_json);
-                }
-            }
-            else if (type_str == msg_types::PLUGIN_ENABLE) {
-                auto enable_msg = parsePluginEnable(payload);
-                if (enable_msg.has_value()) {
-                    bool success = g_plugin_manager->setPluginEnabled(enable_msg->plugin_id,
-                                                                     enable_msg->enabled);
-                    PluginEnableRespMessage resp;
-                    resp.success = success;
-                    if (!success) {
-                        resp.error = "Enable/disable failed";
-                    }
-                    std::string resp_json = serializePluginEnableResp(resp);
-                    pipe->writeLine(resp_json);
-                }
-            }
-            else if (type_str == msg_types::FULL_SYNC_RESPONSE) {
-                handleFullSyncResponse(payload);
-            }
-            else if (type_str == msg_types::SESSION_STATE_CHANGED) {
-                if (pipe == g_gui_pipe) {
-                    LOG_WARN("SESSION_STATE_CHANGED should come from monitor, not gui");
-                } else {
-                    handleSessionStateChange(payload, *g_gui_pipe);
-                }
-            }
-            else if (type_str == msg_types::ACTIVE_SESSIONS_RESP) {
-                handleActiveSessionsResp(message, *g_gui_pipe);
+            } else {
+                LOG_WARN("Unhandled message type: " + type_str);
             }
         } else {
             LOG_WARN("Failed to parse base message");
@@ -514,6 +685,12 @@ int showPluginInfo() {
 //
 // --show-plugin-info 分支与启动失败路径不写 .clean_exit 标记：
 // 它们不是正常会话，不应影响下次启动的归档判断。
+//
+// 阶段 1.6 诊断增强：D1（Job 进程数查询）、D2（Job 句柄继承性）、
+//                    D3（进程快照）、D4（cleanup 详细日志）、
+//                    D5（Job 句柄信息）—— 仅日志，无行为改动。
+//
+// 阶段 1.7 C1：消息分发表接入（5 个 handler 迁移）
 // ================================================================
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--show-plugin-info") {
@@ -522,8 +699,6 @@ int main(int argc, char* argv[]) {
 
     Logger::instance().setProcessName("launcher");
 
-    // 检查上次是否正常退出；异常则把旧日志归档到 logs/crashes/
-    // 必须在任何日志写入之前调用，否则会把本次启动的日志一并归档
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
 
     LOG_INFO("=== Dream Machine Launcher starting ===");
@@ -531,6 +706,9 @@ int main(int argc, char* argv[]) {
     if (archived_prev) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
+
+    // 阶段 1.7 C1：注册消息 handler（必须在事件循环启动前）
+    registerMessageHandlers(g_message_router);
 
     g_plugin_manager = std::make_unique<PluginManager>();
 
@@ -559,6 +737,9 @@ int main(int argc, char* argv[]) {
         } else {
             LOG_INFO("Job Object configured: KILL_ON_JOB_CLOSE + SILENT_BREAKAWAY_OK enabled");
         }
+
+        LOG_INFO("Job Object name: Global\\DreamMachine_Launcher_Job, handle=" +
+                 std::to_string(reinterpret_cast<uintptr_t>(job_handle)));
     }
 
     constexpr int MAX_INSTANCES = 1;
@@ -567,9 +748,12 @@ int main(int argc, char* argv[]) {
     std::string executor_pipe_name_str = pipe_names::launcher_executor();
     std::string gui_pipe_name_str = pipe_names::launcher_gui();
 
-    std::wstring monitor_pipe_name(monitor_pipe_name_str.begin(), monitor_pipe_name_str.end());
-    std::wstring executor_pipe_name(executor_pipe_name_str.begin(), executor_pipe_name_str.end());
-    std::wstring gui_pipe_name(gui_pipe_name_str.begin(), gui_pipe_name_str.end());
+    // C4 编码 helper（阶段 1.7）：
+    //   原 std::wstring(str.begin(), str.end()) 仅对 ASCII 有效；
+    //   utf8ToWide 保证非 ASCII 正确转换。
+    std::wstring monitor_pipe_name = common::utf8ToWide(monitor_pipe_name_str);
+    std::wstring executor_pipe_name = common::utf8ToWide(executor_pipe_name_str);
+    std::wstring gui_pipe_name = common::utf8ToWide(gui_pipe_name_str);
 
     NamedPipe monitor_pipe;
     NamedPipe executor_pipe;
@@ -605,7 +789,7 @@ int main(int argc, char* argv[]) {
     DWORD parent_pid = GetCurrentProcessId();
     for (const auto& info : subprocesses) {
         if (!launchSubprocess(info, g_managed_processes, job_handle, parent_pid)) {
-            LOG_ERROR("Failed to launch " + std::string(info.name.begin(), info.name.end()));
+            LOG_ERROR("Failed to launch " + common::wideToUtf8(info.name));
         }
     }
 
@@ -663,16 +847,13 @@ int main(int argc, char* argv[]) {
         LOG_WARN("Not all processes connected, skipping INIT_LIST distribution");
     }
 
-    // ----- 保存指针供回调使用 -----
     g_monitor_pipe = &monitor_pipe;
     g_executor_pipe = &executor_pipe;
     g_gui_pipe = &gui_pipe;
 
-    // ----- 创建事件循环 -----
     EventLoop event_loop;
-    g_event_loop = &event_loop;   // 保存全局指针以便回调中使用
+    g_event_loop = &event_loop;
 
-    // 注册子进程退出事件
     for (auto& proc : g_managed_processes) {
         EventHandle handle = event_loop.registerWaitable(proc->getHandle(), onProcessExit, proc.get());
         if (!handle.active) {
@@ -682,7 +863,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 注册管道可读事件
     EventHandle monitor_handle = event_loop.registerReadable(monitor_pipe.getHandle(), onPipeReadable, &monitor_pipe);
     if (!monitor_handle.active) {
         LOG_ERROR("Failed to register readable for monitor pipe");
@@ -704,13 +884,11 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Registered readable for gui pipe");
     }
 
-    // 注册心跳定时器（每 100ms 计数，每 100 次输出日志）
     EventHandle heartbeat_handle = event_loop.registerTimer(100, onHeartbeat, nullptr, false);
     if (!heartbeat_handle.active) {
         LOG_WARN("Failed to register heartbeat timer");
     }
 
-    // 注册停止信号（用于外部停止）
     EventHandle stop_signal = event_loop.registerSignal([](EventType type, void* data) {
         (void)type;
         (void)data;
@@ -724,22 +902,18 @@ int main(int argc, char* argv[]) {
     LOG_INFO("Entering event-driven main loop...");
     event_loop.run();
 
-    // ----- 清理 -----
     LOG_INFO("Shutting down launcher...");
 
-    // 取消注册所有事件
     event_loop.unregister(monitor_handle);
     event_loop.unregister(executor_handle);
     event_loop.unregister(gui_handle);
     event_loop.unregister(heartbeat_handle);
     event_loop.unregister(stop_signal);
 
-    // 关闭管道
     monitor_pipe.close();
     executor_pipe.close();
     gui_pipe.close();
 
-    // 清理子进程
     cleanup(g_managed_processes, job_handle);
 
     g_plugin_manager.reset();
@@ -747,7 +921,6 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("=== Launcher exited ===");
 
-    // 写入正常退出标记；下次启动时 archiveLastSessionIfDirty 会消费它
     Logger::instance().markCleanExit();
 
     return 0;
