@@ -4,6 +4,8 @@
 #include "process.h"
 #include "constants.h"
 #include "messages.h"
+#include "message_router.h"
+#include "init_list_utils.h"
 #include "error_codes.h"
 #include "event_loop.h"
 #include "common_utils.h"
@@ -23,7 +25,8 @@
 
 using namespace dream_machine;
 using namespace dream_machine::event;
-using namespace dream_machine::common;
+// 注：阶段 1.7 C4 起不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
 
 namespace {
 
@@ -61,7 +64,24 @@ NamedPipe* g_launcher_pipe = nullptr;
 EventLoop* g_event_loop = nullptr;
 std::atomic<bool> g_should_stop{false};
 
-// ----- 发送会话状态变更（使用结构化序列化） -----
+// 消息分发表（阶段 1.7 C1）
+//
+// 迁移了全部 5 个 handler（SHUTDOWN / INIT_LIST / REQUEST_ENGINE /
+// FULL_SYNC_REQUEST / MONITOR_GET_ACTIVE_SESSIONS）。
+// 无 fallback 特例——所有消息类型统一走 router.dispatch。
+//
+// 回退方式：删除本变量 + registerMessageHandlers 调用，
+//          并将 processLauncherMessage 恢复为原始 if-else 即可。
+MessageRouter g_message_router;
+
+// ----- 前向声明 -----
+void handleFullSyncRequest(const std::string& payload, NamedPipe& launcher_pipe);
+void broadcastShutdownToCoreEngines(const std::string& reason);
+bool checkMaxSessionsReached();
+
+// ================================================================
+// 发送会话状态变更（使用结构化序列化）
+// ================================================================
 void sendSessionStateToLauncher(NamedPipe& launcher_pipe,
                                 const std::string& session_id,
                                 const std::string& state,
@@ -77,40 +97,9 @@ void sendSessionStateToLauncher(NamedPipe& launcher_pipe,
     LOG_INFO("Sent SESSION_STATE_CHANGED: " + session_id + " -> " + state);
 }
 
-// ----- 处理 INIT_LIST -----
-void handleInitList(const std::string& payload, NamedPipe& launcher_pipe) {
-    LOG_INFO("Processing INIT_LIST...");
-
-    auto list = plugin::initListFromJson(payload);
-    if (!list.has_value()) {
-        LOG_ERROR("Failed to parse INIT_LIST payload");
-        return;
-    }
-
-    for (const auto& entry : list->entries) {
-        if (entry.type == plugin::ModificationType::REPLACE) {
-            LOG_INFO("REPLACE: target=" + entry.target_file + ", winner=" + entry.winner_plugin_id);
-        } else if (entry.type == plugin::ModificationType::EXTEND) {
-            LOG_INFO("EXTEND: container=" + entry.container_id + ", plugin=" + entry.plugin_id);
-        }
-        if (!entry.rule_file.empty()) {
-            LOG_INFO("  rule_file: " + entry.rule_file);
-        }
-        if (!entry.trigger.empty()) {
-            LOG_INFO("  trigger: " + entry.trigger);
-        }
-    }
-
-    LOG_INFO("INIT_LIST processing complete");
-    InitListAckMessage ack;
-    ack.status = "ok";
-    std::string ack_json = serializeInitListAck(ack);
-    (void)launcher_pipe.writeLine(ack_json);
-    LOG_INFO("Sent INIT_LIST_ACK");
-}
-
-// ----- 清理崩溃的会话 -----
-// 调用方须持 sessions_mutex_
+// ================================================================
+// 清理崩溃的会话（调用方须持 sessions_mutex_）
+// ================================================================
 void cleanupCrashedSession(const std::string& session_id, NamedPipe& launcher_pipe) {
     auto it = sessions_.find(session_id);
     if (it == sessions_.end()) {
@@ -141,7 +130,9 @@ void cleanupCrashedSession(const std::string& session_id, NamedPipe& launcher_pi
     LOG_INFO("Session " + session_id + " crash cleanup complete");
 }
 
-// ----- 检查会话数量是否达到上限 -----
+// ================================================================
+// 检查会话数量是否达到上限
+// ================================================================
 bool checkMaxSessionsReached() {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     size_t count = 0;
@@ -154,7 +145,9 @@ bool checkMaxSessionsReached() {
     return count >= static_cast<size_t>(constants::MAX_SESSIONS);
 }
 
-// ----- 处理全量同步请求 -----
+// ================================================================
+// 处理全量同步请求
+// ================================================================
 void handleFullSyncRequest(const std::string& payload, NamedPipe& launcher_pipe) {
     auto req = parseFullSyncRequest(payload);
     if (!req.has_value()) {
@@ -195,9 +188,6 @@ void handleFullSyncRequest(const std::string& payload, NamedPipe& launcher_pipe)
 //   - 锁外逐个 writeLine
 //   - 即使会话在发送期间被 erase，pipe 对象仍由 shared_ptr 保活
 //
-// 该设计在单线程下与"锁内一次性 writeLine"行为一致；
-// 未来若 monitor 引入业务内聚线程（Q2 已允许），无需重构。
-//
 // 筛选条件（任务包 1 Q2 裁决）：
 //   状态 ∈ {RUNNING, SHUTTING_DOWN} 且 pipe 有效
 // 写入失败仅 WARN，不重试，不阻塞
@@ -224,7 +214,6 @@ void broadcastShutdownToCoreEngines(const std::string& reason) {
              " core_engine(s), reason=" + reason);
 
     ShutdownMessage msg;
-    // session_id 可选：广播语义下不指定；接收方按自身 session_id 处理
     msg.reason = reason;
     msg.initiator = shutdown_initiator::MONITOR;
 
@@ -242,7 +231,107 @@ void broadcastShutdownToCoreEngines(const std::string& reason) {
 }
 
 // ================================================================
+// 消息 handler 注册（阶段 1.7 C1 / C2）
+//
+// 注册全部 5 个 handler 到全局 router。
+// handler 通过 context (void*) 接收消息来源的 NamedPipe*。
+//
+// 阶段 1.7 C2：INIT_LIST handler 改为调用 init_list_utils::processInitList，
+//              消除与 executor 的重复样板。
+// ================================================================
+void registerMessageHandlers(MessageRouter& router) {
+    // ---- SHUTDOWN ----
+    router.register_handler(msg_types::SHUTDOWN,
+        [](const std::string& payload, void* /*ctx*/) {
+            auto shutdown_msg = parseShutdown(payload);
+            std::string reason = shutdown_msg.has_value()
+                                 ? shutdown_msg->reason
+                                 : std::string(shutdown_reason::PEER_EXIT);
+
+            LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason);
+
+            broadcastShutdownToCoreEngines(reason);
+
+            g_should_stop = true;
+            if (g_event_loop) {
+                g_event_loop->stop();
+            }
+        });
+
+    // ---- INIT_LIST ----
+    // 阶段 1.7 C2：使用公共骨架 processInitList
+    // monitor 无进程特有钩子，使用默认完成日志
+    router.register_handler(msg_types::INIT_LIST,
+        [](const std::string& payload, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (!pipe) return;
+
+            if (!init_list_utils::processInitList(payload)) {
+                return;  // 解析失败，不发 ACK
+            }
+
+            InitListAckMessage ack;
+            ack.status = "ok";
+            std::string ack_json = serializeInitListAck(ack);
+            pipe->writeLine(ack_json);
+            LOG_INFO("Sent INIT_LIST_ACK");
+        });
+
+    // ---- REQUEST_ENGINE ----
+    router.register_handler(msg_types::REQUEST_ENGINE,
+        [](const std::string& /*payload*/, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (!pipe) return;
+
+            LOG_WARN("REQUEST_ENGINE not yet implemented");
+            if (checkMaxSessionsReached()) {
+                LOG_WARN("Max sessions reached, rejecting REQUEST_ENGINE");
+                EngineFailedMessage fail_msg;
+                fail_msg.session_id = "unknown";
+                fail_msg.reason = "max_sessions_reached";
+                std::string fail_json = serializeEngineFailed(fail_msg);
+                pipe->writeLine(fail_json);
+            }
+        });
+
+    // ---- FULL_SYNC_REQUEST ----
+    router.register_handler(msg_types::FULL_SYNC_REQUEST,
+        [](const std::string& payload, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (!pipe) return;
+            handleFullSyncRequest(payload, *pipe);
+        });
+
+    // ---- MONITOR_GET_ACTIVE_SESSIONS ----
+    router.register_handler(msg_types::MONITOR_GET_ACTIVE_SESSIONS,
+        [](const std::string& /*payload*/, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (!pipe) return;
+
+            FullSyncResponseMessage resp_msg;
+            resp_msg.request_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                for (const auto& pair : sessions_) {
+                    if (pair.second->state == SessionState::RUNNING) {
+                        SessionStateChangedMessage s;
+                        s.session_id = pair.second->session_id;
+                        s.state = "running";
+                        resp_msg.sessions.push_back(s);
+                    }
+                }
+            }
+            std::string response = serializeFullSyncResponse(resp_msg);
+            (void)pipe->writeLine(response);
+            LOG_INFO("ACTIVE_SESSIONS_RESP sent");
+        });
+}
+
+// ================================================================
 // 处理 launcher 消息（事件驱动回调）
+//
+// 阶段 1.7 C1：走 MessageRouter 分发。
+// monitor 无 fallback 特例——所有消息类型已迁移。
 // ================================================================
 void processLauncherMessage(EventType type, void* user_data) {
     (void)type;
@@ -283,53 +372,9 @@ void processLauncherMessage(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            if (type_str == msg_types::SHUTDOWN) {
-                // ---- SHUTDOWN 分支（必须位于最前） ----
-                // 流程：解析 → 下行广播 → 停止事件循环
-                auto shutdown_msg = parseShutdown(payload);
-                std::string reason = shutdown_msg.has_value()
-                                     ? shutdown_msg->reason
-                                     : std::string(shutdown_reason::PEER_EXIT);
-
-                LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason);
-
-                // 先向所有 core_engine 下行广播，再停止自身
-                broadcastShutdownToCoreEngines(reason);
-
-                g_should_stop = true;
-                if (g_event_loop) {
-                    g_event_loop->stop();
-                }
-            }
-            else if (type_str == msg_types::INIT_LIST) {
-                handleInitList(payload, launcher_pipe);
-            } else if (type_str == msg_types::REQUEST_ENGINE) {
-                LOG_WARN("REQUEST_ENGINE not yet implemented");
-                if (checkMaxSessionsReached()) {
-                    LOG_WARN("Max sessions reached, rejecting REQUEST_ENGINE");
-                    EngineFailedMessage fail_msg;
-                    fail_msg.session_id = "unknown";
-                    fail_msg.reason = "max_sessions_reached";
-                    std::string fail_json = serializeEngineFailed(fail_msg);
-                    launcher_pipe.writeLine(fail_json);
-                }
-            } else if (type_str == msg_types::FULL_SYNC_REQUEST) {
-                handleFullSyncRequest(payload, launcher_pipe);
-            } else if (type_str == msg_types::MONITOR_GET_ACTIVE_SESSIONS) {
-                FullSyncResponseMessage resp_msg;
-                resp_msg.request_id = 0;
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                for (const auto& pair : sessions_) {
-                    if (pair.second->state == SessionState::RUNNING) {
-                        SessionStateChangedMessage s;
-                        s.session_id = pair.second->session_id;
-                        s.state = "running";
-                        resp_msg.sessions.push_back(s);
-                    }
-                }
-                std::string response = serializeFullSyncResponse(resp_msg);
-                (void)launcher_pipe.writeLine(response);
-                LOG_INFO("ACTIVE_SESSIONS_RESP sent");
+            // ---- 走分发表（阶段 1.7 C1） ----
+            if (!g_message_router.dispatch(type_str, payload, &launcher_pipe)) {
+                LOG_WARN("Unhandled message type: " + type_str);
             }
         } else {
             LOG_WARN("Failed to parse base message");
@@ -404,12 +449,13 @@ void logHeartbeat(EventType type, void* user_data) {
 //
 // 失败路径（父进程校验、连接、注册、事件注册失败）不写 .clean_exit：
 // 它们不是正常会话，下次启动时应被识别为异常退出并归档。
+//
+// 阶段 1.7 C1：消息分发表接入（5 个 handler 迁移）
+// 阶段 1.7 C2：INIT_LIST 使用公共骨架（消除重复样板）
 // ================================================================
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("monitor");
 
-    // 检查上次是否正常退出；异常则把旧日志归档到 logs/crashes/
-    // 必须在任何日志写入之前调用
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
 
     LOG_INFO("=== Dream Machine Monitor starting ===");
@@ -418,7 +464,9 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
-    // 使用 common_utils 解析参数并验证父进程
+    // 阶段 1.7 C1：注册消息 handler（必须在事件循环启动前）
+    registerMessageHandlers(g_message_router);
+
     std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
     DWORD expected_parent_pid = 0;
     if (!parent_pid_str.empty()) {
@@ -445,7 +493,9 @@ int main(int argc, char* argv[]) {
     }
 
     std::string pipe_name_str = pipe_names::launcher_monitor();
-    std::wstring pipe_name(pipe_name_str.begin(), pipe_name_str.end());
+
+    // C4 编码 helper（阶段 1.7）
+    std::wstring pipe_name = common::utf8ToWide(pipe_name_str);
 
     LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);
 
@@ -469,9 +519,6 @@ int main(int argc, char* argv[]) {
     }
     LOG_INFO("Registration message sent: " + register_msg);
 
-    // ============================================================
-    // 初始化事件循环
-    // ============================================================
     g_launcher_pipe = &launcher_pipe;
 
     EventLoop event_loop;
@@ -522,9 +569,6 @@ int main(int argc, char* argv[]) {
     LOG_INFO("Entering event-driven main loop...");
     event_loop.run();
 
-    // ============================================================
-    // 清理
-    // ============================================================
     LOG_INFO("Shutting down monitor...");
 
     event_loop.unregister(read_handle);
@@ -569,7 +613,6 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("=== Monitor exited ===");
 
-    // 写入正常退出标记；下次启动时 archiveLastSessionIfDirty 会消费它
     Logger::instance().markCleanExit();
 
     return 0;

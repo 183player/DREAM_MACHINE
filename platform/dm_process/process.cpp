@@ -2,6 +2,7 @@
 #include "process.h"
 
 #include "logger.h"
+#include "common_utils.h"
 
 #include <string>
 #include <memory>
@@ -77,12 +78,10 @@ HANDLE Process::getRealHandle() const {
     }
 
     // 尝试以 QUERY_LIMITED_INFORMATION 权限打开进程
-    // 如果已有句柄权限不足，这能提供备用方案
     if (HANDLE h_query = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid_)) {
         return h_query;
     }
 
-    // 如果 handle_ 本身权限足够，直接使用
     return handle_;
 }
 
@@ -101,7 +100,6 @@ bool Process::start(const std::wstring& executable,
 }
 
 bool Process::start(const ProcessStartOptions& options) {
-    // 清理已有句柄
     if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
         CloseHandle(handle_);
         handle_ = nullptr;
@@ -113,49 +111,44 @@ bool Process::start(const ProcessStartOptions& options) {
         return false;
     }
 
-    // 构建命令行
     std::wstring cmd_line = buildCommandLine(options);
 
-    // 准备启动信息
     STARTUPINFOW si = {sizeof(STARTUPINFOW)};
     PROCESS_INFORMATION pi = {nullptr, nullptr, 0, 0};
 
-    // 构建创建标志（使用 auto 简化类型）
     auto creation_flags = static_cast<DWORD>(options.creation_flags);
-
-    // 如果指定了 Job Object，但子进程需要使用 BREAKAWAY 标志
-    // 注意：CREATE_BREAKAWAY_FROM_JOB 必须在创建时指定才有效
-    // 如果 options.job_handle 不为空，但 creation_flags 没有包含 BREAKAWAY，
-    // 则子进程会继承父进程的 Job Object（如果有的话）
 
     BOOL inherit = options.inherit_handles ? TRUE : FALSE;
 
     BOOL success = CreateProcessW(
         options.executable.c_str(),
         cmd_line.data(),
-        nullptr,                     // 进程安全属性
-        nullptr,                     // 线程安全属性
-        inherit,                     // 句柄继承标志
-        creation_flags,              // 创建标志
-        nullptr,                     // 环境变量
-        nullptr,                     // 当前目录
+        nullptr,
+        nullptr,
+        inherit,
+        creation_flags,
+        nullptr,
+        nullptr,
         &si,
         &pi
     );
 
     if (!success) {
         DWORD err = GetLastError();
-        std::string exe_str(options.executable.begin(), options.executable.end());
+        // C4 编码 helper（阶段 1.7）：
+        //   原 std::string(exe.begin(), exe.end()) 仅对 ASCII 有效；
+        //   wideToUtf8 保证非 ASCII 正确转换。
+        const std::string exe_str = common::wideToUtf8(options.executable);
         LOG_ERROR("CreateProcessW failed for " + exe_str + ": error " + std::to_string(err));
         return false;
     }
 
-    // 保存进程句柄和 PID
     handle_ = pi.hProcess;
     pid_ = pi.dwProcessId;
-    CloseHandle(pi.hThread);  // 线程句柄不再需要
+    CloseHandle(pi.hThread);
 
-    std::string exe_str(options.executable.begin(), options.executable.end());
+    // C4 编码 helper（阶段 1.7）：同上
+    const std::string exe_str = common::wideToUtf8(options.executable);
     LOG_INFO("Process started: " + exe_str + " (PID: " + std::to_string(pid_) + ")");
 
     // ============================================================
@@ -165,7 +158,6 @@ bool Process::start(const ProcessStartOptions& options) {
         if (!assignToJob(options.job_handle)) {
             LOG_WARN("Failed to assign process (PID: " + std::to_string(pid_) +
                      ") to Job Object, continuing anyway");
-            // 非致命错误，继续运行
         }
     }
 
@@ -177,8 +169,6 @@ bool Process::start(const ProcessStartOptions& options) {
                      ") did not become idle within " + std::to_string(options.timeout_ms) + "ms");
         } else if (wait_result == WAIT_OBJECT_0) {
             LOG_INFO("Process (PID: " + std::to_string(pid_) + ") is ready");
-        } else {
-            // WAIT_FAILED 或 WAIT_ABANDONED，不严重，忽略
         }
     }
 
@@ -226,7 +216,6 @@ bool Process::isInJob(std::optional<DWORD>* out_job_id) const {
         return false;
     }
 
-    // 使用 IsProcessInJob 检测
     BOOL is_in_job = FALSE;
     if (!IsProcessInJob(handle_, nullptr, &is_in_job)) {
         DWORD err = GetLastError();
@@ -242,11 +231,8 @@ bool Process::isInJob(std::optional<DWORD>* out_job_id) const {
         return false;
     }
 
-    // 尝试获取作业 ID（使用 NtQueryInformationProcess）
     if (out_job_id) {
         if (HANDLE h_query = getRealHandle()) {
-            // 使用 NtQueryInformationProcess 查询 JobObjectId
-            // 但为了简化，这里直接返回 0 表示存在作业但无法获取 ID
             *out_job_id = 0;
             if (h_query != handle_) {
                 CloseHandle(h_query);
@@ -263,7 +249,6 @@ bool Process::breakawayFromJob() const {
         return false;
     }
 
-    // 检查进程是否在作业中
     BOOL is_in_job = FALSE;
     if (!IsProcessInJob(handle_, nullptr, &is_in_job)) {
         DWORD err = GetLastError();
@@ -276,11 +261,6 @@ bool Process::breakawayFromJob() const {
         return true;
     }
 
-    // 尝试将进程分配到一个空的作业对象（即脱离）
-    // 方法：创建一个临时作业对象，将进程分配进去
-    // 注意：这需要进程具有 JOB_OBJECT_LIMIT_BREAKAWAY_OK 权限
-    // 或者进程创建时带有 CREATE_BREAKAWAY_FROM_JOB 标志
-
     HANDLE temp_job = CreateJobObjectW(nullptr, nullptr);
     if (!temp_job) {
         DWORD err = GetLastError();
@@ -288,14 +268,12 @@ bool Process::breakawayFromJob() const {
         return false;
     }
 
-    // 设置限制：允许脱离
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_info = {};
     job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
     if (!SetInformationJobObject(temp_job, JobObjectExtendedLimitInformation,
                                  &job_info, sizeof(job_info))) {
         DWORD err = GetLastError();
         LOG_WARN("SetInformationJobObject failed: error " + std::to_string(err));
-        // 继续尝试 AssignProcessToJobObject
     }
 
     bool result = false;
@@ -318,7 +296,7 @@ bool Process::breakawayFromJob() const {
 bool Process::waitForExit(DWORD timeout_ms) const {
     if (handle_ == nullptr || handle_ == INVALID_HANDLE_VALUE) {
         LOG_WARN("waitForExit called on invalid handle");
-        return true;  // 进程已不存在
+        return true;
     }
 
     DWORD result = WaitForSingleObject(handle_, timeout_ms);
@@ -370,7 +348,7 @@ std::optional<DWORD> Process::getExitCode() const {
 
     DWORD wait_result = WaitForSingleObject(handle_, 0);
     if (wait_result != WAIT_OBJECT_0) {
-        return std::nullopt;  // 进程尚未退出
+        return std::nullopt;
     }
 
     DWORD exit_code = 0;

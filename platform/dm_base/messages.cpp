@@ -44,6 +44,11 @@ static bool parseSimplePayload(const std::string& json, QJsonObject& out_obj) {
 // buildMessage / parseBaseMessage
 // ================================================================
 
+// 构建消息：自动写入 version = msg_version::CURRENT
+//
+// 依据阶段 1.7 B4：
+//   - version 由本函数统一写入，调用方无需感知
+//   - 当前版本 = 1；未来升级需同步更新 messages.h 中的 msg_version::CURRENT
 std::string buildMessage(const std::string& type,
                          const std::string& cmd,
                          const std::string& payload_json) {
@@ -53,14 +58,21 @@ std::string buildMessage(const std::string& type,
         obj["cmd"] = toQString(cmd);
     }
     obj["payload"] = toQString(payload_json);
+    obj["version"] = msg_version::CURRENT;
     QJsonDocument doc(obj);
     return doc.toJson(QJsonDocument::Compact).toStdString();
 }
 
+// 解析消息基字段（带版本）
+//
+// 依据阶段 1.7 B4：
+//   - version 字段缺失时给 CURRENT（兼容旧消息，不产生噪声）
+//   - 不做版本不匹配的 WARN（由调用方决定是否处理）
 bool parseBaseMessage(const std::string& json,
                       std::string& out_type,
                       std::string& out_cmd,
-                      std::string& out_payload) {
+                      std::string& out_payload,
+                      int& out_version) {
     QJsonParseError error;
     QJsonDocument doc = QJsonDocument::fromJson(toQString(json).toUtf8(), &error);
     if (error.error != QJsonParseError::NoError) {
@@ -73,7 +85,26 @@ bool parseBaseMessage(const std::string& json,
     out_type = toStdString(obj["type"].toString());
     out_cmd = toStdString(obj["cmd"].toString());
     out_payload = toStdString(obj["payload"].toString());
+
+    // version：兼容缺失字段，给默认当前版本
+    if (obj.contains("version") && obj["version"].isDouble()) {
+        out_version = obj["version"].toInt(msg_version::CURRENT);
+    } else {
+        out_version = msg_version::CURRENT;
+    }
     return true;
+}
+
+// 解析消息基字段（兼容签名，忽略 version）
+//
+// 保留此签名以保证现有调用点零改动；
+// 内部委托给带 version 的重载。
+bool parseBaseMessage(const std::string& json,
+                      std::string& out_type,
+                      std::string& out_cmd,
+                      std::string& out_payload) {
+    int ignored_version = 0;
+    return parseBaseMessage(json, out_type, out_cmd, out_payload, ignored_version);
 }
 
 // ================================================================

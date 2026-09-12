@@ -2,6 +2,7 @@
 #include "pipe.h"
 
 #include "logger.h"
+#include "common_utils.h"
 
 #include <cstring>
 #include <limits>
@@ -40,7 +41,7 @@ SECURITY_ATTRIBUTES* NamedPipe::createSecureSecurityAttributes(
 }
 
 // ================================================================
-// 构造函数 / 析构函数
+// 构造函数 / 析构函数 / 移动语义
 // ================================================================
 
 NamedPipe::NamedPipe() {
@@ -242,7 +243,8 @@ bool NamedPipe::createServer(const std::wstring& pipe_name,
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
-        std::string name(pipe_name.begin(), pipe_name.end());
+        // C4 编码 helper（阶段 1.7）
+        const std::string name = common::wideToUtf8(pipe_name);
         LOG_ERROR("CreateNamedPipeW failed for " + name + ": error " + std::to_string(err));
         return false;
     }
@@ -251,7 +253,8 @@ bool NamedPipe::createServer(const std::wstring& pipe_name,
     is_server_ = true;
     resetBuffer();
 
-    std::string name(pipe_name.begin(), pipe_name.end());
+    // C4 编码 helper（阶段 1.7）
+    const std::string name = common::wideToUtf8(pipe_name);
     LOG_INFO("Named pipe server created: " + name + " (handle: " +
              std::to_string(reinterpret_cast<uintptr_t>(handle_)) + ", secure=" +
              (secure ? "true" : "false") + ")");
@@ -344,14 +347,16 @@ bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
         handle_ = h;
         is_server_ = false;
         resetBuffer();
-        std::string name(pipe_name.begin(), pipe_name.end());
+        // C4 编码 helper（阶段 1.7）
+        const std::string name = common::wideToUtf8(pipe_name);
         LOG_INFO("Connected to named pipe: " + name);
         return true;
     }
 
     DWORD err = GetLastError();
     if (err != ERROR_PIPE_BUSY && err != ERROR_FILE_NOT_FOUND) {
-        std::string name(pipe_name.begin(), pipe_name.end());
+        // C4 编码 helper（阶段 1.7）
+        const std::string name = common::wideToUtf8(pipe_name);
         LOG_ERROR("CreateFileW failed for " + name + ": error " + std::to_string(err));
         return false;
     }
@@ -377,14 +382,16 @@ bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
                 handle_ = h;
                 is_server_ = false;
                 resetBuffer();
-                std::string name(pipe_name.begin(), pipe_name.end());
+                // C4 编码 helper（阶段 1.7）
+                const std::string name = common::wideToUtf8(pipe_name);
                 LOG_INFO("Connected to named pipe: " + name);
                 return true;
             }
 
             DWORD err2 = GetLastError();
             if (err2 != ERROR_PIPE_BUSY) {
-                std::string name(pipe_name.begin(), pipe_name.end());
+                // C4 编码 helper（阶段 1.7）
+                const std::string name = common::wideToUtf8(pipe_name);
                 LOG_ERROR("CreateFileW retry failed for " + name + ": error " + std::to_string(err2));
                 return false;
             }
@@ -392,7 +399,8 @@ bool NamedPipe::connect(const std::wstring& pipe_name, DWORD timeout_ms) {
 
         DWORD elapsed = GetTickCount() - start_time;
         if (elapsed >= timeout_ms) {
-            std::string name(pipe_name.begin(), pipe_name.end());
+            // C4 编码 helper（阶段 1.7）
+            const std::string name = common::wideToUtf8(pipe_name);
             LOG_WARN("connect timeout for " + name + " after " + std::to_string(timeout_ms) + "ms");
             return false;
         }
@@ -410,7 +418,8 @@ bool NamedPipe::connectWithRetry(const std::wstring& pipe_name,
 
     for (int attempt = 0; attempt <= max_retries; ++attempt) {
         if (attempt > 0) {
-            std::string name(pipe_name.begin(), pipe_name.end());
+            // C4 编码 helper（阶段 1.7）
+            const std::string name = common::wideToUtf8(pipe_name);
             LOG_INFO("Retry " + std::to_string(attempt) + "/" + std::to_string(max_retries) +
                      " connecting to: " + name);
             Sleep(static_cast<DWORD>(delay_ms));
@@ -422,7 +431,8 @@ bool NamedPipe::connectWithRetry(const std::wstring& pipe_name,
         }
     }
 
-    std::string name(pipe_name.begin(), pipe_name.end());
+    // C4 编码 helper（阶段 1.7）
+    const std::string name = common::wideToUtf8(pipe_name);
     LOG_ERROR("Failed to connect to " + name + " after " +
               std::to_string(max_retries + 1) + " attempts");
     return false;

@@ -9,12 +9,15 @@ target_include_directories(dm_pipe PUBLIC
 )
 
 # 私有依赖：日志模块（pipe.cpp 中使用了 LOG_* 宏）
+#          基础库（pipe.cpp 中使用了 common::wideToUtf8）
 target_include_directories(dm_pipe PRIVATE
         ${CMAKE_SOURCE_DIR}/platform/dm_logger
+        ${CMAKE_SOURCE_DIR}/platform/dm_base
 )
 
 target_link_libraries(dm_pipe PRIVATE
         dm_logger
+        dm_base
 )
 
 # Windows 特定：无需额外库，windows.h 为系统 API

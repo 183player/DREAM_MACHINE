@@ -3,6 +3,8 @@
 
 #include "logger.h"
 #include <string>
+#include <cstdint>
+#include <atomic>
 #include <windows.h>
 #include <tlhelp32.h>
 
@@ -64,6 +66,99 @@ inline bool verifyParentPid(DWORD expected_parent_pid) {
 
     LOG_INFO("Parent PID verification passed (PID: " + std::to_string(real_parent_pid) + ")");
     return true;
+}
+
+// ================================================================
+// 编码转换：UTF-8 ↔ UTF-16
+//
+// 用途：Win32 API 使用 UTF-16（wchar_t 在 Windows 上为 2 字节），
+//       而项目内部字符串统一使用 UTF-8（std::string）。
+//       在调用 CreateNamedPipeW / CreateFileW 等宽字符 API 前，
+//       需要先做转换。
+//
+// 保守设计（依据阶段 1.7 保守规划）：
+//   - 仅提供两个函数，不引入其他编码相关能力
+//   - 转换失败返回空字符串（调用方按"无效输入"处理）
+//   - 不使用 std::filesystem::path 互转（当前无此需求）
+//   - 不做编码检测（当前所有输入均为有效 UTF-8）
+//
+// 注：项目此前的 "std::wstring(str.begin(), str.end())" 是逐字节扩展，
+//     仅对 ASCII 有效。本 helper 保证非 ASCII（中文路径等）正确转换。
+// ================================================================
+
+// UTF-8 → UTF-16
+// 空输入返回空字符串（非错误）
+inline std::wstring utf8ToWide(const std::string& utf8_str) {
+    if (utf8_str.empty()) {
+        return std::wstring();
+    }
+
+    const int wide_len = MultiByteToWideChar(
+        CP_UTF8, 0,
+        utf8_str.data(), static_cast<int>(utf8_str.size()),
+        nullptr, 0);
+    if (wide_len <= 0) {
+        return std::wstring();
+    }
+
+    std::wstring result(static_cast<size_t>(wide_len), L'\0');
+    const int written = MultiByteToWideChar(
+        CP_UTF8, 0,
+        utf8_str.data(), static_cast<int>(utf8_str.size()),
+        result.data(), wide_len);
+    if (written != wide_len) {
+        return std::wstring();
+    }
+    return result;
+}
+
+// UTF-16 → UTF-8
+// 空输入返回空字符串（非错误）
+inline std::string wideToUtf8(const std::wstring& wide_str) {
+    if (wide_str.empty()) {
+        return std::string();
+    }
+
+    const int utf8_len = WideCharToMultiByte(
+        CP_UTF8, 0,
+        wide_str.data(), static_cast<int>(wide_str.size()),
+        nullptr, 0,
+        nullptr, nullptr);
+    if (utf8_len <= 0) {
+        return std::string();
+    }
+
+    std::string result(static_cast<size_t>(utf8_len), '\0');
+    const int written = WideCharToMultiByte(
+        CP_UTF8, 0,
+        wide_str.data(), static_cast<int>(wide_str.size()),
+        result.data(), utf8_len,
+        nullptr, nullptr);
+    if (written != utf8_len) {
+        return std::string();
+    }
+    return result;
+}
+
+// ================================================================
+// request_id 统一生成器（阶段 1.7 B2）
+//
+// 用途：为"请求-响应关联"场景提供进程内唯一 ID。例如：
+//   - 未来的 REQUEST_ENGINE 会话创建请求需关联响应
+//
+// 保守设计：
+//   - 不强制使用：现有 FULL_SYNC 保留自己的生成方式
+//   - 单点定义：所有新调用方从此处获取，避免各进程各自造号
+//   - 单调递增：fetch_add 保证唯一性
+//   - 跨 TU 唯一：inline 函数中的 static 局部变量在 C++ 中唯一
+//
+// 起始值 = 1（0 保留为"未设置"语义，与现有 FullSyncRequestMessage 一致）
+//
+// 线程安全：使用 std::atomic，即使未来引入业务内聚线程也无需修改。
+// ================================================================
+inline int64_t nextRequestId() {
+    static std::atomic<int64_t> counter{1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace common
