@@ -3,6 +3,7 @@
 #include "pipe.h"
 #include "constants.h"
 #include "messages.h"
+#include "message_router.h"
 #include "session_state_manager.h"
 #include "plugin_loader.h"
 #include "status_provider.h"
@@ -33,7 +34,8 @@
 
 using namespace dream_machine;
 using namespace dream_machine::gui;
-using namespace dream_machine::common;
+// 注：阶段 1.7 C4 起不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
 
 // ================================================================
 // 未来重审点（依据 DREAM_MACHINE_CONCURRENCY_MODEL_BOUNDARY 专家裁决 Q4）：
@@ -60,10 +62,24 @@ static std::unique_ptr<QTimer> g_timeoutTimer;
 static std::unique_ptr<QTimer> g_showPlaceholderTimer;
 static std::atomic<bool> g_should_stop{false};
 
+// 消息分发表（阶段 1.7 C1）
+//
+// 迁移了全部 4 个 handler（SHUTDOWN / INIT_LIST / SESSION_STATE_UPDATE /
+// INIT_SESSION_LIST）。gui 无 fallback 特例。
+//
+// 回退方式：删除本变量 + registerMessageHandlers 调用，
+//          并将 pollPipe 恢复为原始 if-else 即可。
+static MessageRouter g_message_router;
+
 // ================================================================
 // 内部辅助（匿名命名空间）
 // ================================================================
 namespace {
+
+// ----- 前向声明 -----
+void handleInitList(const std::string& payload);
+void handleInitSessionList(const std::string& payload);
+void handleSessionStateUpdate(const std::string& payload);
 
 bool isDevMode() {
     const char* dev_mode = std::getenv("DM_DEV_MODE");
@@ -283,14 +299,61 @@ void handleSessionStateUpdate(const std::string& payload) {
 }
 
 // ================================================================
+// 消息 handler 注册（阶段 1.7 C1）
+//
+// 注册 4 个 handler 到全局 router。
+// gui handler 均通过 g_pipe 全局直接访问管道，不使用 ctx 参数。
+//
+// 注：这些 handler 在 Qt 主线程中执行（由 pollPipe 通过 QTimer 触发），
+//     可安全访问 Qt 对象（g_pluginLoader / g_statusProvider / g_sessionManager）。
+// ================================================================
+void registerMessageHandlers(MessageRouter& router) {
+    // ---- SHUTDOWN ----
+    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决 Q4：
+    //   直接 QApplication::quit()，不弹确认框
+    //   reason 仅用于日志区分，不影响退出行为
+    router.register_handler(msg_types::SHUTDOWN,
+        [](const std::string& payload, void* /*ctx*/) {
+            auto shutdown_msg = parseShutdown(payload);
+            std::string reason = shutdown_msg.has_value()
+                                 ? shutdown_msg->reason
+                                 : std::string(shutdown_reason::PEER_EXIT);
+
+            LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason +
+                     ", quitting GUI");
+
+            g_should_stop = true;
+            QApplication::quit();
+        });
+
+    // ---- INIT_LIST ----
+    router.register_handler(msg_types::INIT_LIST,
+        [](const std::string& payload, void* /*ctx*/) {
+            handleInitList(payload);
+        });
+
+    // ---- SESSION_STATE_UPDATE ----
+    router.register_handler(msg_types::SESSION_STATE_UPDATE,
+        [](const std::string& payload, void* /*ctx*/) {
+            handleSessionStateUpdate(payload);
+        });
+
+    // ---- INIT_SESSION_LIST ----
+    router.register_handler(msg_types::INIT_SESSION_LIST,
+        [](const std::string& payload, void* /*ctx*/) {
+            handleInitSessionList(payload);
+        });
+}
+
+// ================================================================
 // 管道轮询（QTimer 50ms 触发）
 //
+// 阶段 1.7 C1：走 MessageRouter 分发。
 // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决 Q4-Q7：
-//   - Q4: 收到 SHUTDOWN 直接 QApplication::quit()，不弹确认框
-//   - Q5: 日志由 Logger 内部每次写入即 flush（file_stream_ << formatted << std::flush），
-//         本函数无需额外 flush 动作
+//   - Q4: 收到 SHUTDOWN 直接 QApplication::quit()（由 handler 处理）
+//   - Q5: 日志由 Logger 内部每次写入即 flush
 //   - Q6: pollTimer 由 QApplication::exec() 返回后的 main() 统一停止
-//   - Q7: readLine(3000) 保持不动（现有实现，不是本次改动范围）
+//   - Q7: readLine(3000) 保持不动
 // ================================================================
 void pollPipe() {
     if (!g_pipe || g_should_stop) {
@@ -327,28 +390,10 @@ void pollPipe() {
 
             std::string type, cmd, payload;
             if (parseBaseMessage(message, type, cmd, payload)) {
-                if (type == msg_types::SHUTDOWN) {
-                    // ---- SHUTDOWN 分支（必须位于最前） ----
-                    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决 Q4：
-                    //   GUI 收到 SHUTDOWN 后直接 QApplication::quit()，不弹确认框
-                    //   reason 仅用于日志区分，不影响退出行为
-                    auto shutdown_msg = parseShutdown(payload);
-                    std::string reason = shutdown_msg.has_value()
-                                         ? shutdown_msg->reason
-                                         : std::string(shutdown_reason::PEER_EXIT);
-
-                    LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason +
-                             ", quitting GUI");
-
-                    g_should_stop = true;
-                    QApplication::quit();
-                }
-                else if (type == msg_types::INIT_LIST) {
-                    handleInitList(payload);
-                } else if (type == msg_types::SESSION_STATE_UPDATE) {
-                    handleSessionStateUpdate(payload);
-                } else if (type == msg_types::INIT_SESSION_LIST) {
-                    handleInitSessionList(payload);
+                // ---- 走分发表（阶段 1.7 C1） ----
+                // gui handler 不需要 ctx（通过 g_pipe 全局直接访问）
+                if (!g_message_router.dispatch(type, payload, nullptr)) {
+                    LOG_WARN("Unhandled message type: " + type);
                 }
             } else {
                 LOG_WARN("Failed to parse base message");
@@ -392,12 +437,12 @@ void onTimeout() {
 //
 // 失败路径（父进程校验、连接 launcher 失败）不写 .clean_exit：
 // 它们不是正常会话，下次启动时应被识别为异常退出并归档。
+//
+// 阶段 1.7 C1：消息分发表接入（4 个 handler 迁移）
 // ================================================================
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("gui");
 
-    // 检查上次是否正常退出；异常则把旧日志归档到 logs/crashes/
-    // 必须在任何日志写入之前调用
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
 
     LOG_INFO("=== Dream Machine GUI starting ===");
@@ -406,7 +451,12 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
-    // 使用 common_utils 解析参数并验证父进程
+    // 阶段 1.7 C1：注册消息 handler（必须在 Qt 事件循环启动前）
+    // 注：registerMessageHandlers 中的 lambda 不访问 Qt 对象，
+    //     仅访问全局 router 与函数指针（handleInitList 等）。
+    //     实际访问 Qt 对象发生在 pollPipe 触发时（Qt 主线程内），安全。
+    registerMessageHandlers(g_message_router);
+
     std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
     DWORD expected_parent_pid = 0;
     if (!parent_pid_str.empty()) {
@@ -418,7 +468,9 @@ int main(int argc, char* argv[]) {
     }
 
     std::string pipe_name_str = pipe_names::launcher_gui();
-    std::wstring pipe_name(pipe_name_str.begin(), pipe_name_str.end());
+
+    // C4 编码 helper（阶段 1.7）
+    std::wstring pipe_name = common::utf8ToWide(pipe_name_str);
 
     LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);
 
@@ -586,7 +638,6 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("=== GUI exited with code " + std::to_string(result) + " ===");
 
-    // 写入正常退出标记；下次启动时 archiveLastSessionIfDirty 会消费它
     Logger::instance().markCleanExit();
 
     return 0;

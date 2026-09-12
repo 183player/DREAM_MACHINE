@@ -74,6 +74,19 @@ namespace msg_types {
 }
 
 // ================================================================
+// 协议版本（阶段 1.7 B4）
+//
+// buildMessage 自动将 version 写入所有消息，parseBaseMessage 读取。
+// 当前设计（保守）：
+//   - 只提供字段与常量，不做版本协商
+//   - 版本不匹配仅记录 WARN，仍继续处理（不拒绝）
+//   - 未来若需协商，可在此基础上扩展
+// ================================================================
+namespace msg_version {
+    inline constexpr int CURRENT = 1;
+}
+
+// ================================================================
 // SHUTDOWN 消息受控常量
 //
 // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 专家裁决：
@@ -99,10 +112,13 @@ namespace shutdown_initiator {
 // ================================================================
 
 // ---- 基础消息 ----
+// version 由 buildMessage 自动写入，parseBaseMessage 读取。
+// 现有调用点无需感知；需要版本感知时可使用新增的 parseBaseMessage 重载。
 struct BaseMessage {
     std::string type;
     std::string cmd;
     std::string payload;
+    int version = msg_version::CURRENT;
 };
 
 // ---- 注册 ----
@@ -344,13 +360,25 @@ std::optional<EngineDiedMessage> parseEngineDied(const std::string& json);
 // ================================================================
 // 通用辅助函数
 // ================================================================
+
+// 构建消息 JSON。自动写入 version = msg_version::CURRENT。
 std::string buildMessage(const std::string& type,
                          const std::string& cmd,
                          const std::string& payload_json);
 
+// 解析消息基字段（兼容版本：忽略 version）
+// 保留此签名以保证现有调用点零改动。
 bool parseBaseMessage(const std::string& json,
                       std::string& out_type,
                       std::string& out_cmd,
                       std::string& out_payload);
+
+// 解析消息基字段（带版本）
+// 用于未来需要版本感知的调用点。缺字段时 out_version 给 CURRENT。
+bool parseBaseMessage(const std::string& json,
+                      std::string& out_type,
+                      std::string& out_cmd,
+                      std::string& out_payload,
+                      int& out_version);
 
 } // namespace dream_machine

@@ -3,6 +3,7 @@
 #include "pipe.h"
 #include "constants.h"
 #include "messages.h"
+#include "message_router.h"
 #include "event_loop.h"
 #include "common_utils.h"
 
@@ -15,7 +16,8 @@
 
 using namespace dream_machine;
 using namespace dream_machine::event;
-using namespace dream_machine::common;
+// 注：阶段 1.7 C4 起不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
 
 namespace {
 
@@ -36,7 +38,49 @@ EventLoop* g_event_loop = nullptr;
 std::atomic<bool> g_should_stop{false};
 std::string g_session_id;
 
-// ----- 处理 monitor 消息（回调） -----
+// 消息分发表（阶段 1.7 C1）
+//
+// monitor 侧：迁移了 1 个 handler（SHUTDOWN）。
+// executor 侧：STEP_* / OP_DONE / OP_ABORT 尚未实现，
+//              保持 TODO 原样，未来实现 A3 时接入。
+//
+// 回退方式：删除本变量 + registerMonitorMessageHandlers 调用，
+//          并将 processMonitorMessage 恢复为原始 if-else 即可。
+MessageRouter g_monitor_router;
+
+// ----- 前向声明 -----
+void registerMonitorMessageHandlers(MessageRouter& router);
+
+// ================================================================
+// monitor 消息 handler 注册（阶段 1.7 C1）
+// ================================================================
+void registerMonitorMessageHandlers(MessageRouter& router) {
+    // ---- SHUTDOWN ----
+    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
+    //   - 接收方自行决定退出时机，广播方不强制
+    //   - 记录 reason 用于日志区分（peer_exit / user_close / signal）
+    //   - 即使 payload 解析失败也按默认 reason 处理，避免僵死
+    router.register_handler(msg_types::SHUTDOWN,
+        [](const std::string& payload, void* /*ctx*/) {
+            auto shutdown_msg = parseShutdown(payload);
+            std::string reason = shutdown_msg.has_value()
+                                 ? shutdown_msg->reason
+                                 : std::string(shutdown_reason::PEER_EXIT);
+
+            LOG_INFO("Received SHUTDOWN from monitor, reason=" + reason);
+
+            g_should_stop = true;
+            if (g_event_loop) {
+                g_event_loop->stop();
+            }
+        });
+}
+
+// ================================================================
+// 处理 monitor 消息（回调）
+//
+// 阶段 1.7 C1：走 MessageRouter 分发。
+// ================================================================
 void processMonitorMessage(EventType type, void* user_data) {
     (void)type;
     if (!g_monitor_pipe || g_should_stop) {
@@ -76,22 +120,9 @@ void processMonitorMessage(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            if (type_str == msg_types::SHUTDOWN) {
-                // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
-                //   - 接收方自行决定退出时机，广播方不强制
-                //   - 记录 reason 用于日志区分（peer_exit / user_close / signal）
-                //   - 即使 payload 解析失败也按默认 reason 处理，避免僵死
-                auto shutdown_msg = parseShutdown(payload);
-                std::string reason = shutdown_msg.has_value()
-                                     ? shutdown_msg->reason
-                                     : std::string(shutdown_reason::PEER_EXIT);
-
-                LOG_INFO("Received SHUTDOWN from monitor, reason=" + reason);
-
-                g_should_stop = true;
-                if (g_event_loop) {
-                    g_event_loop->stop();
-                }
+            // ---- 走分发表（阶段 1.7 C1） ----
+            if (!g_monitor_router.dispatch(type_str, payload, &monitor_pipe)) {
+                LOG_WARN("Unhandled message type from monitor: " + type_str);
             }
         } else {
             LOG_WARN("Failed to parse base message from monitor");
@@ -107,7 +138,12 @@ void processMonitorMessage(EventType type, void* user_data) {
     }
 }
 
-// ----- 处理 executor 消息（回调） -----
+// ================================================================
+// 处理 executor 消息（回调）
+//
+// 注：executor 侧消息处理尚未实现（A3 任务），保持 TODO 原样。
+//     未来实现时，可参考 monitor 侧接入 MessageRouter。
+// ================================================================
 void processExecutorMessage(EventType type, void* user_data) {
     (void)type;
     if (!g_executor_pipe || g_should_stop) {
@@ -156,7 +192,9 @@ void processExecutorMessage(EventType type, void* user_data) {
     }
 }
 
-// ----- 心跳日志（定时回调） -----
+// ================================================================
+// 心跳日志（定时回调）
+// ================================================================
 int g_heartbeat_counter = 0;
 
 void logHeartbeat(EventType type, void* user_data) {
@@ -183,6 +221,8 @@ void logHeartbeat(EventType type, void* user_data) {
 // 日志文件名规则：
 //   session_id 有效 → "core_engine_{session_id}.log"
 //   session_id 缺失 → "core_engine.log"（仅在拒绝运行前记录诊断信息）
+//
+// 阶段 1.7 C1：monitor 侧消息分发表接入（1 个 handler 迁移）
 // ================================================================
 int main(int argc, char* argv[]) {
     // ----- 1. 先解析命令行参数（无日志） -----
@@ -204,6 +244,9 @@ int main(int argc, char* argv[]) {
     // ----- 3. 开始日志输出 -----
     LOG_INFO("=== Dream Machine Core Engine starting ===");
 
+    // 阶段 1.7 C1：注册 monitor 侧消息 handler（必须在事件循环启动前）
+    registerMonitorMessageHandlers(g_monitor_router);
+
     // ----- 4. 校验父进程 -----
     if (!common::verifyParentPid(expected_parent_pid)) {
         return 1;
@@ -219,8 +262,9 @@ int main(int argc, char* argv[]) {
 
     // ----- 连接到 executor -----
     std::string executor_pipe_name_str = pipe_names::executor_core();
-    std::wstring executor_pipe_name(executor_pipe_name_str.begin(),
-                                     executor_pipe_name_str.end());
+
+    // C4 编码 helper（阶段 1.7）
+    std::wstring executor_pipe_name = common::utf8ToWide(executor_pipe_name_str);
 
     LOG_INFO("Connecting to executor pipe: " + executor_pipe_name_str);
 
@@ -234,8 +278,9 @@ int main(int argc, char* argv[]) {
 
     // ----- 连接到 monitor -----
     std::string monitor_pipe_name_str = pipe_names::monitor_core(g_session_id);
-    std::wstring monitor_pipe_name(monitor_pipe_name_str.begin(),
-                                    monitor_pipe_name_str.end());
+
+    // C4 编码 helper（阶段 1.7）：同上
+    std::wstring monitor_pipe_name = common::utf8ToWide(monitor_pipe_name_str);
 
     LOG_INFO("Connecting to monitor pipe: " + monitor_pipe_name_str);
 
@@ -338,5 +383,8 @@ int main(int argc, char* argv[]) {
     g_event_loop = nullptr;
 
     LOG_INFO("=== Core Engine exited (session: " + g_session_id + ") ===");
+
+    Logger::instance().markCleanExit();
+
     return 0;
 }

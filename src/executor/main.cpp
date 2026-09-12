@@ -3,6 +3,8 @@
 #include "pipe.h"
 #include "constants.h"
 #include "messages.h"
+#include "message_router.h"
+#include "init_list_utils.h"
 #include "event_loop.h"
 #include "common_utils.h"
 
@@ -18,7 +20,8 @@
 
 using namespace dream_machine;
 using namespace dream_machine::event;
-using namespace dream_machine::common;
+// 注：阶段 1.7 C4 起不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
 
 namespace {
 
@@ -37,36 +40,86 @@ std::atomic<bool> g_should_stop{false};
 // 存储从 INIT_LIST 中提取的脚本路径（用于后续执行）
 std::vector<std::string> g_script_paths;
 
-// 处理 INIT_LIST 消息
-void handleInitList(const std::string& payload) {
-    LOG_INFO("Processing INIT_LIST...");
+// 消息分发表（阶段 1.7 C1）
+//
+// 迁移了全部 3 个 handler（SHUTDOWN / INIT_LIST / RUN_SCRIPT）。
+// 无 fallback 特例——所有消息类型统一走 router.dispatch。
+//
+// 回退方式：删除本变量 + registerMessageHandlers 调用，
+//          并将 processLauncherMessage 恢复为原始 if-else 即可。
+MessageRouter g_message_router;
 
-    auto list = plugin::initListFromJson(payload);
-    if (!list.has_value()) {
-        LOG_ERROR("Failed to parse INIT_LIST payload");
-        return;
-    }
+// ================================================================
+// 消息 handler 注册（阶段 1.7 C1 / C2）
+//
+// 注册全部 3 个 handler 到全局 router。
+//
+// 阶段 1.7 C2：INIT_LIST handler 改为调用 init_list_utils::processInitList，
+//              通过 Hooks 注入 executor 特有行为：
+//                - on_parsed    : 清空 g_script_paths
+//                - on_completed : 输出 "stored N script paths" 日志
+// ================================================================
+void registerMessageHandlers(MessageRouter& router) {
+    // ---- SHUTDOWN ----
+    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
+    //   - 接收方自行决定退出时机，广播方不强制
+    //   - 记录 reason 用于日志区分（peer_exit / user_close / signal）
+    //   - 立即停事件循环，不做重试
+    router.register_handler(msg_types::SHUTDOWN,
+        [](const std::string& payload, void* /*ctx*/) {
+            auto shutdown_msg = parseShutdown(payload);
+            std::string reason = shutdown_msg.has_value()
+                                 ? shutdown_msg->reason
+                                 : std::string(shutdown_reason::PEER_EXIT);
 
-    g_script_paths.clear();
+            LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason);
 
-    for (const auto& entry : list->entries) {
-        if (entry.type == plugin::ModificationType::REPLACE) {
-            LOG_INFO("REPLACE: target=" + entry.target_file + ", winner=" + entry.winner_plugin_id);
-        } else if (entry.type == plugin::ModificationType::EXTEND) {
-            LOG_INFO("EXTEND: container=" + entry.container_id + ", plugin=" + entry.plugin_id);
-        }
-        if (!entry.rule_file.empty()) {
-            LOG_INFO("  rule_file: " + entry.rule_file);
-        }
-        if (!entry.trigger.empty()) {
-            LOG_INFO("  trigger: " + entry.trigger);
-        }
-    }
+            g_should_stop = true;
+            if (g_event_loop) {
+                g_event_loop->stop();
+            }
+        });
 
-    LOG_INFO("INIT_LIST processing complete, stored " + std::to_string(g_script_paths.size()) + " script paths");
+    // ---- INIT_LIST ----
+    // 阶段 1.7 C2：使用公共骨架 processInitList + executor 特有钩子
+    router.register_handler(msg_types::INIT_LIST,
+        [](const std::string& payload, void* ctx) {
+            auto* pipe = static_cast<NamedPipe*>(ctx);
+            if (!pipe) return;
+
+            init_list_utils::Hooks hooks;
+            hooks.on_parsed = []() {
+                g_script_paths.clear();
+            };
+            hooks.on_completed = []() {
+                LOG_INFO("INIT_LIST processing complete, stored " +
+                         std::to_string(g_script_paths.size()) + " script paths");
+            };
+
+            if (!init_list_utils::processInitList(payload, hooks)) {
+                return;  // 解析失败，不发 ACK
+            }
+
+            InitListAckMessage ack;
+            ack.status = "ok";
+            std::string ack_json = serializeInitListAck(ack);
+            pipe->writeLine(ack_json);
+            LOG_INFO("Sent INIT_LIST_ACK");
+        });
+
+    // ---- RUN_SCRIPT ----
+    router.register_handler(msg_types::RUN_SCRIPT,
+        [](const std::string& /*payload*/, void* /*ctx*/) {
+            LOG_WARN("RUN_SCRIPT not yet implemented");
+        });
 }
 
+// ================================================================
 // 处理 launcher 消息（事件驱动回调）
+//
+// 阶段 1.7 C1：走 MessageRouter 分发。
+// executor 无 fallback 特例——所有消息类型已迁移。
+// ================================================================
 void processLauncherMessage(EventType type, void* user_data) {
     (void)type;
     if (!g_pipe || g_should_stop) {
@@ -106,33 +159,9 @@ void processLauncherMessage(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            if (type_str == msg_types::SHUTDOWN) {
-                // ---- SHUTDOWN 分支（必须位于最前） ----
-                // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
-                //   - 接收方自行决定退出时机，广播方不强制
-                //   - 记录 reason 用于日志区分（peer_exit / user_close / signal）
-                //   - 立即停事件循环，不做重试
-                auto shutdown_msg = parseShutdown(payload);
-                std::string reason = shutdown_msg.has_value()
-                                     ? shutdown_msg->reason
-                                     : std::string(shutdown_reason::PEER_EXIT);
-
-                LOG_INFO("Received SHUTDOWN from launcher, reason=" + reason);
-
-                g_should_stop = true;
-                if (g_event_loop) {
-                    g_event_loop->stop();
-                }
-            }
-            else if (type_str == msg_types::INIT_LIST) {
-                handleInitList(payload);
-                InitListAckMessage ack;
-                ack.status = "ok";
-                std::string ack_json = serializeInitListAck(ack);
-                pipe.writeLine(ack_json);
-                LOG_INFO("Sent INIT_LIST_ACK");
-            } else if (type_str == msg_types::RUN_SCRIPT) {
-                LOG_WARN("RUN_SCRIPT not yet implemented");
+            // ---- 走分发表（阶段 1.7 C1） ----
+            if (!g_message_router.dispatch(type_str, payload, &pipe)) {
+                LOG_WARN("Unhandled message type: " + type_str);
             }
         } else {
             LOG_WARN("Failed to parse base message");
@@ -172,12 +201,13 @@ void logHeartbeat(EventType type, void* user_data) {
 //
 // 失败路径（父进程校验、连接、注册、事件注册失败）不写 .clean_exit：
 // 它们不是正常会话，下次启动时应被识别为异常退出并归档。
+//
+// 阶段 1.7 C1：消息分发表接入（3 个 handler 迁移）
+// 阶段 1.7 C2：INIT_LIST 使用公共骨架（Hooks 注入进程特有行为）
 // ================================================================
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("executor");
 
-    // 检查上次是否正常退出；异常则把旧日志归档到 logs/crashes/
-    // 必须在任何日志写入之前调用
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
 
     LOG_INFO("=== Dream Machine Executor starting ===");
@@ -186,7 +216,9 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
-    // 使用 common_utils 解析参数并验证父进程
+    // 阶段 1.7 C1：注册消息 handler（必须在事件循环启动前）
+    registerMessageHandlers(g_message_router);
+
     std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
     DWORD expected_parent_pid = 0;
     if (!parent_pid_str.empty()) {
@@ -199,7 +231,9 @@ int main(int argc, char* argv[]) {
 
     // 连接到 launcher
     std::string pipe_name_str = pipe_names::launcher_executor();
-    std::wstring pipe_name(pipe_name_str.begin(), pipe_name_str.end());
+
+    // C4 编码 helper（阶段 1.7）
+    std::wstring pipe_name = common::utf8ToWide(pipe_name_str);
 
     LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);
 
@@ -222,9 +256,6 @@ int main(int argc, char* argv[]) {
     }
     LOG_INFO("Registration message sent: " + register_msg);
 
-    // ============================================================
-    // 初始化事件循环
-    // ============================================================
     g_pipe = &pipe;
 
     EventLoop event_loop;
@@ -264,9 +295,6 @@ int main(int argc, char* argv[]) {
     LOG_INFO("Entering event-driven main loop...");
     event_loop.run();
 
-    // ============================================================
-    // 清理
-    // ============================================================
     LOG_INFO("Shutting down executor...");
 
     event_loop.unregister(read_handle);
@@ -280,7 +308,6 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("=== Executor exited ===");
 
-    // 写入正常退出标记；下次启动时 archiveLastSessionIfDirty 会消费它
     Logger::instance().markCleanExit();
 
     return 0;
