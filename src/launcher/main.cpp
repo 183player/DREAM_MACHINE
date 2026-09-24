@@ -24,8 +24,8 @@
 using namespace dream_machine;
 using namespace dream_machine::launcher;
 using namespace dream_machine::event;
-// 注：阶段 1.7 C4 起不再 using dream_machine::common——
-//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
+// 注：不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 / pathFromRoot 用 common:: 前缀显式调用。
 
 // ================================================================
 // 前向声明
@@ -81,7 +81,7 @@ EventHandle g_grace_timer_handle{0, false};
 // 诊断：Job 句柄信息仅记录一次
 bool g_job_info_logged = false;
 
-// 消息分发表（阶段 1.7 C1）
+// 消息分发表
 //
 // 迁移了 5 个 handler（PLUGIN_IMPORT / PLUGIN_DELETE / PLUGIN_ENABLE /
 // FULL_SYNC_RESPONSE / SESSION_STATE_CHANGED）。
@@ -93,7 +93,7 @@ bool g_job_info_logged = false;
 MessageRouter g_message_router;
 
 // 用于在回调中访问的上下文
-// 注：当前未被实际使用（保留为未来状态收敛的载体，见 F1.5-C3）
+// 注：当前未被实际使用（保留为未来状态收敛的载体）
 struct LauncherContext {
     NamedPipe* monitor_pipe;
     NamedPipe* executor_pipe;
@@ -109,21 +109,15 @@ std::unique_ptr<LauncherContext> g_context;
 // 用于 cleanup() 关闭 Job 前确认残留情况。
 // 失败时返回 -1（不影响主流程）。
 //
-// 依据：阶段 1.6 诊断增强 D1
-//
-// 错误码说明（阶段 1.6 修复）：
+// 错误码说明：
 //   QueryInformationJobObject 在 buffer=NULL 时返回
 //   ERROR_BAD_LENGTH(24)，而非 ERROR_MORE_DATA(234)。
-//   实测日志出现 "size query failed: 24" 即此原因。
-//   修复：同时接受 ERROR_BAD_LENGTH 与 ERROR_MORE_DATA
-//        （旧版 Windows 可能返回后者）。
 // ================================================================
 int queryJobProcessCount(HANDLE job_handle) {
     if (!job_handle || job_handle == INVALID_HANDLE_VALUE) {
         return -1;
     }
 
-    // 第一次调用：查询所需 buffer 大小
     DWORD bytes_needed = 0;
     if (!QueryInformationJobObject(job_handle, JobObjectBasicProcessIdList,
                                     nullptr, 0, &bytes_needed)) {
@@ -137,12 +131,10 @@ int queryJobProcessCount(HANDLE job_handle) {
         }
     }
 
-    // bytes_needed == 0 表示 Job 中无进程
     if (bytes_needed == 0) {
         return 0;
     }
 
-    // 第二次调用：获取实际数据
     std::vector<char> buffer(bytes_needed);
     if (!QueryInformationJobObject(job_handle, JobObjectBasicProcessIdList,
                                     buffer.data(), bytes_needed, &bytes_needed)) {
@@ -158,8 +150,6 @@ int queryJobProcessCount(HANDLE job_handle) {
 
 // ================================================================
 // 诊断辅助：Job 句柄继承性检查（仅记录一次）
-//
-// 依据：阶段 1.6 诊断增强 D2
 // ================================================================
 void logJobHandleInfoOnce(HANDLE job_handle) {
     if (g_job_info_logged) {
@@ -187,7 +177,6 @@ bool launchSubprocess(const SubprocessInfo& info,
                       std::vector<std::shared_ptr<Process>>& managed_processes,
                       HANDLE job_handle,
                       DWORD parent_pid) {
-    // 诊断：首次启动子进程时记录 Job 句柄信息
     logJobHandleInfoOnce(job_handle);
 
     ProcessStartOptions options;
@@ -213,10 +202,6 @@ bool launchSubprocess(const SubprocessInfo& info,
 
 // ================================================================
 // 强制清理：terminate 所有存活子进程并关闭 Job Object
-//
-// 依据阶段 1.6 诊断增强 D4：
-//   - 每个进程 terminate 前记录 isRunning 状态
-//   - Job 关闭前记录剩余进程数
 // ================================================================
 void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HANDLE job_handle) {
     for (const auto& proc : managed_processes) {
@@ -256,20 +241,9 @@ void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HAN
 // ================================================================
 // 优雅关闭流程
 //
-// 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
-//   - 向所有存活直接子进程（monitor / executor / gui）广播 SHUTDOWN
-//   - 启动 500ms 一次性定时器（幂等）
-//   - 若所有子进程提前退出，由 onProcessExit 提前 stop
-//
-// 幂等性：g_shutdown_requested.exchange(true) 保证首次进入才执行广播
-// 线程安全：本函数可在 onProcessExit / stop_signal 回调中调用
-//           （当前单线程事件循环；未来引入业务内聚线程时需重审）
-//
-// 未来重审点（P3-1 / 依据 ISSUE-LAUNCHER-LAST-EXIT-LOG-MISSING）：
-//   最后一个退出进程的 WAITABLE 回调可能未触发（日志少一条）。
-//   修复方案：EventLoop 新增 drainPendingEvents()，
-//   stop 前处理完所有已 signaled 的 WAITABLE 事件。
-//   归入阶段 5（横切打磨），与 C1/C2/C4 同批。
+// 未来重审点：最后一个退出进程的 WAITABLE 回调可能未触发
+//             （日志少一条）。修复方案：EventLoop 新增 drainPendingEvents()，
+//             stop 前处理完所有已 signaled 的 WAITABLE 事件。
 // ================================================================
 void requestGracefulShutdown(const std::string& reason) {
     if (g_shutdown_requested.exchange(true)) {
@@ -278,7 +252,6 @@ void requestGracefulShutdown(const std::string& reason) {
 
     LOG_INFO("Graceful shutdown requested, reason=" + reason);
 
-    // ----- 1. 广播 SHUTDOWN 给所有存活直接子进程 -----
     ShutdownMessage msg;
     msg.reason = reason;
     msg.initiator = shutdown_initiator::LAUNCHER;
@@ -310,7 +283,6 @@ void requestGracefulShutdown(const std::string& reason) {
     broadcast(g_executor_pipe, "executor");
     broadcast(g_gui_pipe, "gui");
 
-    // ----- 2. 启动 500ms 一次性定时器（幂等） -----
     if (!g_grace_timer_started.exchange(true)) {
         if (g_event_loop) {
             g_grace_timer_handle = g_event_loop->registerTimer(
@@ -419,12 +391,7 @@ void handleFullSyncResponse(const std::string& payload) {
 }
 
 // ================================================================
-// 消息 handler 注册（阶段 1.7 C1）
-//
-// 注册 5 个 handler 到全局 router。handler 通过 context (void*)
-// 接收消息来源的 NamedPipe*。
-//
-// 未迁移：ACTIVE_SESSIONS_RESP（需完整 message 字符串，见 router 注释）。
+// 消息 handler 注册
 // ================================================================
 void registerMessageHandlers(MessageRouter& router) {
     // ---- PLUGIN_IMPORT ----
@@ -496,7 +463,6 @@ void registerMessageHandlers(MessageRouter& router) {
         });
 
     // ---- SESSION_STATE_CHANGED ----
-    // 消息来源应为 monitor；若来自 gui 则为异常。
     router.register_handler(msg_types::SESSION_STATE_CHANGED,
         [](const std::string& payload, void* ctx) {
             auto* pipe = static_cast<NamedPipe*>(ctx);
@@ -514,11 +480,6 @@ void registerMessageHandlers(MessageRouter& router) {
 // 事件回调函数
 // ================================================================
 
-// 子进程退出回调
-//
-// 依据阶段 1.6 诊断增强 D3：
-//   记录 all_exited 判断时的完整进程状态快照，
-//   便于定位"提前 stop 但最后进程日志缺失"的场景。
 void onProcessExit(EventType type, void* user_data) {
     (void)type;
     Process* proc = static_cast<Process*>(user_data);
@@ -528,7 +489,6 @@ void onProcessExit(EventType type, void* user_data) {
 
     LOG_INFO("Subprocess (PID: " + std::to_string(proc->getPid()) + ") has exited");
 
-    // 诊断 D3：记录所有子进程状态快照
     {
         std::string snapshot = "Process snapshot:";
         bool all_exited = true;
@@ -546,7 +506,6 @@ void onProcessExit(EventType type, void* user_data) {
         snapshot += ", all_exited=" + std::string(all_exited ? "true" : "false");
         LOG_INFO(snapshot);
 
-        // 触发优雅关闭（幂等）
         requestGracefulShutdown(shutdown_reason::PEER_EXIT);
 
         if (all_exited) {
@@ -558,9 +517,6 @@ void onProcessExit(EventType type, void* user_data) {
     }
 }
 
-// 管道可读回调（处理消息）
-//
-// 阶段 1.7 C1：优先走 MessageRouter，未注册的走 fallback（ACTIVE_SESSIONS_RESP）。
 void onPipeReadable(EventType type, void* user_data) {
     (void)type;
     if (!user_data || g_shutdown_requested) return;
@@ -585,7 +541,7 @@ void onPipeReadable(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            // ---- 优先走分发表（阶段 1.7 C1） ----
+            // ---- 优先走分发表 ----
             if (g_message_router.dispatch(type_str, payload, pipe)) {
                 return;
             }
@@ -608,7 +564,6 @@ void onPipeReadable(EventType type, void* user_data) {
     }
 }
 
-// 心跳日志（定时回调）
 int g_heartbeat_counter = 0;
 void onHeartbeat(EventType type, void* user_data) {
     (void)type;
@@ -679,18 +634,16 @@ int showPluginInfo() {
 // ================================================================
 // main 入口
 //
-// 日志生命周期（阶段 1.5 P1-5）：
-//   - 启动：setProcessName → archiveLastSessionIfDirty → 开始日志
+// 路径策略（Step 0 路径修正）：
+//   所有运行时资源（logs/ / plugins/ / data/）基于可执行文件所在目录，
+//   不依赖当前工作目录（CWD）。保证 bin/ 整体挪走后仍正常运行。
+//
+// 日志生命周期：
+//   - 启动：setProcessName → setLogDirectory → archiveLastSessionIfDirty → 开始日志
 //   - 退出：最后一条日志 → markCleanExit → return 0
 //
 // --show-plugin-info 分支与启动失败路径不写 .clean_exit 标记：
 // 它们不是正常会话，不应影响下次启动的归档判断。
-//
-// 阶段 1.6 诊断增强：D1（Job 进程数查询）、D2（Job 句柄继承性）、
-//                    D3（进程快照）、D4（cleanup 详细日志）、
-//                    D5（Job 句柄信息）—— 仅日志，无行为改动。
-//
-// 阶段 1.7 C1：消息分发表接入（5 个 handler 迁移）
 // ================================================================
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--show-plugin-info") {
@@ -698,6 +651,9 @@ int main(int argc, char* argv[]) {
     }
 
     Logger::instance().setProcessName("launcher");
+
+    // 路径修正：日志目录基于 exe 目录，不依赖 CWD
+    Logger::instance().setLogDirectory(common::pathFromRoot("logs"));
 
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
 
@@ -707,7 +663,6 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
-    // 阶段 1.7 C1：注册消息 handler（必须在事件循环启动前）
     registerMessageHandlers(g_message_router);
 
     g_plugin_manager = std::make_unique<PluginManager>();
@@ -748,9 +703,6 @@ int main(int argc, char* argv[]) {
     std::string executor_pipe_name_str = pipe_names::launcher_executor();
     std::string gui_pipe_name_str = pipe_names::launcher_gui();
 
-    // C4 编码 helper（阶段 1.7）：
-    //   原 std::wstring(str.begin(), str.end()) 仅对 ASCII 有效；
-    //   utf8ToWide 保证非 ASCII 正确转换。
     std::wstring monitor_pipe_name = common::utf8ToWide(monitor_pipe_name_str);
     std::wstring executor_pipe_name = common::utf8ToWide(executor_pipe_name_str);
     std::wstring gui_pipe_name = common::utf8ToWide(gui_pipe_name_str);
