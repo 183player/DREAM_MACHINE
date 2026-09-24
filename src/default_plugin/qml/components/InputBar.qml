@@ -57,7 +57,9 @@ Rectangle {
                     }
 
                     // Ctrl+Enter 发送
-                    Keys.onPressed: {
+                    // 注：Keys.onPressed 是附加属性，只能通过附加语法绑定。
+                    //     Enter（无修饰符）不在此处理，保留 TextArea 的默认换行行为。
+                    Keys.onPressed: function(event) {
                         if (event.key === Qt.Key_Enter || event.key === Qt.Key_Return) {
                             if (event.modifiers & Qt.ControlModifier) {
                                 event.accepted = true
@@ -109,20 +111,6 @@ Rectangle {
         }
         inputArea.text = ""
         inputArea.focus = true
-    }
-
-    // ---------- 快捷键 ----------
-    // Enter 发送（非 Ctrl+Enter）
-    Connections {
-        target: inputArea
-        function onKeyPressed(event) {
-            if (event.key === Qt.Key_Enter || event.key === Qt.Key_Return) {
-                if (!(event.modifiers & Qt.ControlModifier)) {
-                    event.accepted = true
-                    sendMessage()
-                }
-            }
-        }
     }
 
     // ---------- 将全局参数传递到内部 ----------

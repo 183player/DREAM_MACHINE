@@ -20,8 +20,8 @@
 
 using namespace dream_machine;
 using namespace dream_machine::event;
-// 注：阶段 1.7 C4 起不再 using dream_machine::common——
-//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
+// 注：不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 / pathFromRoot 用 common:: 前缀显式调用。
 
 namespace {
 
@@ -40,7 +40,7 @@ std::atomic<bool> g_should_stop{false};
 // 存储从 INIT_LIST 中提取的脚本路径（用于后续执行）
 std::vector<std::string> g_script_paths;
 
-// 消息分发表（阶段 1.7 C1）
+// 消息分发表
 //
 // 迁移了全部 3 个 handler（SHUTDOWN / INIT_LIST / RUN_SCRIPT）。
 // 无 fallback 特例——所有消息类型统一走 router.dispatch。
@@ -50,21 +50,17 @@ std::vector<std::string> g_script_paths;
 MessageRouter g_message_router;
 
 // ================================================================
-// 消息 handler 注册（阶段 1.7 C1 / C2）
+// 消息 handler 注册
 //
 // 注册全部 3 个 handler 到全局 router。
 //
-// 阶段 1.7 C2：INIT_LIST handler 改为调用 init_list_utils::processInitList，
-//              通过 Hooks 注入 executor 特有行为：
-//                - on_parsed    : 清空 g_script_paths
-//                - on_completed : 输出 "stored N script paths" 日志
+// INIT_LIST handler 调用 init_list_utils::processInitList，
+// 通过 Hooks 注入 executor 特有行为：
+//   - on_parsed    : 清空 g_script_paths
+//   - on_completed : 输出 "stored N script paths" 日志
 // ================================================================
 void registerMessageHandlers(MessageRouter& router) {
     // ---- SHUTDOWN ----
-    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
-    //   - 接收方自行决定退出时机，广播方不强制
-    //   - 记录 reason 用于日志区分（peer_exit / user_close / signal）
-    //   - 立即停事件循环，不做重试
     router.register_handler(msg_types::SHUTDOWN,
         [](const std::string& payload, void* /*ctx*/) {
             auto shutdown_msg = parseShutdown(payload);
@@ -81,7 +77,6 @@ void registerMessageHandlers(MessageRouter& router) {
         });
 
     // ---- INIT_LIST ----
-    // 阶段 1.7 C2：使用公共骨架 processInitList + executor 特有钩子
     router.register_handler(msg_types::INIT_LIST,
         [](const std::string& payload, void* ctx) {
             auto* pipe = static_cast<NamedPipe*>(ctx);
@@ -116,9 +111,6 @@ void registerMessageHandlers(MessageRouter& router) {
 
 // ================================================================
 // 处理 launcher 消息（事件驱动回调）
-//
-// 阶段 1.7 C1：走 MessageRouter 分发。
-// executor 无 fallback 特例——所有消息类型已迁移。
 // ================================================================
 void processLauncherMessage(EventType type, void* user_data) {
     (void)type;
@@ -159,7 +151,6 @@ void processLauncherMessage(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            // ---- 走分发表（阶段 1.7 C1） ----
             if (!g_message_router.dispatch(type_str, payload, &pipe)) {
                 LOG_WARN("Unhandled message type: " + type_str);
             }
@@ -195,18 +186,21 @@ void logHeartbeat(EventType type, void* user_data) {
 // ================================================================
 // main 入口
 //
-// 日志生命周期（阶段 1.5 P1-5）：
-//   - 启动：setProcessName → archiveLastSessionIfDirty → 开始日志
+// 路径策略（Step 0 路径修正）：
+//   所有运行时资源基于可执行文件所在目录，不依赖 CWD。
+//
+// 日志生命周期：
+//   - 启动：setProcessName → setLogDirectory → archiveLastSessionIfDirty → 开始日志
 //   - 退出：最后一条日志 → markCleanExit → return 0
 //
 // 失败路径（父进程校验、连接、注册、事件注册失败）不写 .clean_exit：
 // 它们不是正常会话，下次启动时应被识别为异常退出并归档。
-//
-// 阶段 1.7 C1：消息分发表接入（3 个 handler 迁移）
-// 阶段 1.7 C2：INIT_LIST 使用公共骨架（Hooks 注入进程特有行为）
 // ================================================================
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("executor");
+
+    // 路径修正：日志目录基于 exe 目录，不依赖 CWD
+    Logger::instance().setLogDirectory(common::pathFromRoot("logs"));
 
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
 
@@ -216,7 +210,6 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
-    // 阶段 1.7 C1：注册消息 handler（必须在事件循环启动前）
     registerMessageHandlers(g_message_router);
 
     std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
@@ -232,7 +225,6 @@ int main(int argc, char* argv[]) {
     // 连接到 launcher
     std::string pipe_name_str = pipe_names::launcher_executor();
 
-    // C4 编码 helper（阶段 1.7）
     std::wstring pipe_name = common::utf8ToWide(pipe_name_str);
 
     LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);

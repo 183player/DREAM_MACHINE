@@ -1,20 +1,46 @@
 {
-  "colors": {
-    "primary": "#3A7BD5",
-    "primary_hover": "#4A8BE5",
-    "secondary": "#888888",
-    "background": "#1E1E2E",
-    "background_alt": "#2A2A3E",
-    "surface": "#2D2D44",
-    "surface_alt": "#3A3A5A",
-    "text_primary": "#EEEEEE",
-    "text_secondary": "#AAAAAA",
-    "text_muted": "#666666",
-    "border": "#3A3A5A",
-    "success": "#4CAF50",
-    "warning": "#FFC107",
-    "error": "#F44336",
-    "info": "#2196F3"
+  "theme": {
+    "default_mode": "light",
+    "modes": {
+      "light": {
+        "colors": {
+          "primary": "#3A7BD5",
+          "primary_hover": "#4A8BE5",
+          "secondary": "#888888",
+          "background": "#F0F0F0",
+          "background_alt": "#E8E8E8",
+          "surface": "#FFFFFF",
+          "surface_alt": "#F5F5F5",
+          "text_primary": "#333333",
+          "text_secondary": "#666666",
+          "text_muted": "#999999",
+          "border": "#D0D0D0",
+          "success": "#4CAF50",
+          "warning": "#FFC107",
+          "error": "#D32F2F",
+          "info": "#2196F3"
+        }
+      },
+      "dark": {
+        "colors": {
+          "primary": "#3A7BD5",
+          "primary_hover": "#4A8BE5",
+          "secondary": "#888888",
+          "background": "#1E1E2E",
+          "background_alt": "#2A2A3E",
+          "surface": "#2D2D44",
+          "surface_alt": "#3A3A5A",
+          "text_primary": "#EEEEEE",
+          "text_secondary": "#AAAAAA",
+          "text_muted": "#666666",
+          "border": "#3A3A5A",
+          "success": "#4CAF50",
+          "warning": "#FFC107",
+          "error": "#F44336",
+          "info": "#2196F3"
+        }
+      }
+    }
   },
   "fonts": {
     "family": "Segoe UI, sans-serif",
@@ -43,8 +69,20 @@
     "chat_area_padding": 12,
     "input_area_height": 60,
     "status_bar_height": 24,
+
     "min_window_width": 800,
-    "min_window_height": 600
+    "min_window_height": 600,
+
+    "initial_window_width_ratio": 0.6,
+    "initial_window_height_ratio": 0.7,
+    "initial_window_max_width": 1600,
+    "initial_window_max_height": 1000,
+
+    "placeholder_width_base": 360,
+    "placeholder_height_base": 150,
+    "placeholder_scale_reference_width": 1920,
+    "placeholder_scale_min": 1.0,
+    "placeholder_scale_max": 1.5
   },
   "animation": {
     "duration_short": 150,

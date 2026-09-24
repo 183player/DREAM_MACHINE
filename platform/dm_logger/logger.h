@@ -9,7 +9,18 @@
 
 namespace dream_machine {
 
+    // ================================================================
+    // 日志级别
+    //
+    // 命名规则：所有枚举值避免与 Windows 宏冲突。
+    //   - ERROR（wingdi.h）→ 用 ERR
+    //   - DEBUG（MSVC Debug 配置 / 某些 SDK）→ 用 DBG
+    //
+    // 注：本原则（风险规避优先于先例）是项目既有约定——ERR 早已采用
+    //     此做法；本文件补齐 DEBUG → DBG，保持一致。
+    // ================================================================
     enum class LogLevel {
+        DBG,      // 开发调试（默认关闭，由 setMinLevel 控制）
         INFO,
         WARN,
         ERR,      // 避免与 Windows wingdi.h 中的 ERROR 宏冲突
@@ -22,8 +33,17 @@ namespace dream_machine {
     //   - 崩溃归档（.clean_exit 标记检测）
     //   - channel 路由（thread_local 语义，用于插件/脚本日志隔离）
     //   - ERROR 独立文件（DM_LOG_ERROR_SEPARATE=1 启用）
+    //   - 信号总线订阅（通过内部 Adapter，方案 D）
     //
-    // 日志文件命名规范（契约 #4 / #8 / #11 / #16）：
+    // 信号订阅（方案 D）：
+    //   Logger 不直接继承 ISignalSink；内部通过 LoggerSignalAdapter
+    //   （定义在 logger.cpp 的匿名命名空间）订阅 SignalBus。
+    //   上层通过静态方法 attach_to_signal_bus() / detach_from_signal_bus()
+    //   显式装配/卸载。
+    //   原因：保持 logger.h 独立（不 include signal_sink.h），
+    //         避免向所有下游传递 dm_signal 依赖。
+    //
+    // 日志文件命名规范：
     //   {process_name}.log                         主日志
     //   {process_name}.log.N                       轮转文件（N 从 1 开始）
     //   {process_name}.error.log                   ERROR 独立文件
@@ -32,10 +52,6 @@ namespace dream_machine {
     //   {process_name}.{channel}.error.log         channel + ERROR
     //   logs/.clean_exit_{process_name}            正常退出标记
     //   logs/crashes/crash_{timestamp}_{process}[_{session_id}].log  崩溃归档
-    //
-    // 其中 {process_name} 由 setProcessName() 决定：
-    //   - 普通进程："launcher" / "monitor" / "executor" / "gui"
-    //   - core_engine："core_engine_{session_id}"
     // ================================================================
     class Logger {
     public:
@@ -45,53 +61,48 @@ namespace dream_machine {
         // 配置接口
         // ============================================================
 
-        // 设置进程名（决定日志文件名前缀）
-        // 若已初始化，会立即切换到新文件
         void setProcessName(const std::string& name);
-
         void setLogDirectory(const std::string& path);
         void setMinLevel(LogLevel level);
 
-        // 单文件大小上限（默认 10MB），超过后触发轮转
         void setMaxFileSize(std::size_t bytes);
-
-        // 每个日志文件的轮转保留数（默认 10），超过后删除最旧
         void setMaxBackupFiles(int count);
 
         // ============================================================
         // 生命周期标记
         // ============================================================
 
-        // 启动时调用：检测上次是否异常退出
-        //   - 若 logs/.clean_exit_{process_name} 存在 → 上次正常退出
-        //     → 删除标记，返回 false
-        //   - 否则 → 上次异常退出（或首次启动）
-        //     → 若 {process_name}.log 存在，归档到 logs/crashes/
-        //     → 返回 true（发生了归档）；无日志可归档时返回 false
-        //
-        // 副作用：
-        //   - 归档后触发 cleanupOldCrashes()，按进程基名分组保留最新 20 个
         [[nodiscard]] bool archiveLastSessionIfDirty();
-
-        // 正常退出时调用：写入 logs/.clean_exit_{process_name}
-        // 在下一次启动时被 archiveLastSessionIfDirty() 消费
         void markCleanExit();
 
         // ============================================================
-        // Channel 路由（thread_local 语义）
-        //
-        // 当前线程 channel 为空时，写入 {process_name}.log；
-        // 非空时，写入 {process_name}.{channel}.log。
-        //
-        // channel 命名建议（契约 #9）：
-        //   plugin_{name}    插件日志
-        //   script_{name}    脚本日志
-        //
-        // 推荐使用 LogChannelScope（RAII），避免手动恢复。
+        // Channel 路由
         // ============================================================
 
         void setChannel(const std::string& channel);
         [[nodiscard]] std::string getChannel() const;
+
+        // ============================================================
+        // 信号总线装配（方案 D）
+        //
+        // attach_to_signal_bus:
+        //   将内部 Adapter 订阅到 SignalBus。
+        //   幂等：重复调用无副作用。
+        //   建议在 main() 启动时调用（在 SignalBus 订阅顺序中排第一）。
+        //
+        // detach_from_signal_bus:
+        //   将内部 Adapter 从 SignalBus 卸载。
+        //   幂等：重复调用无副作用。
+        //   建议在 main() 退出前调用。
+        //
+        // 注：Logger 析构中不自动 detach——原因：
+        //     Logger 与 SignalBus 均为 Meyers 单例；若 SignalBus 后构造
+        //     则先析构，Logger 析构时访问 SignalBus 会导致 UB。
+        //     由各进程显式 detach 解决。
+        // ============================================================
+
+        static void attach_to_signal_bus();
+        static void detach_from_signal_bus();
 
         // ============================================================
         // 核心日志接口
@@ -109,22 +120,19 @@ namespace dream_machine {
         // ----------------------------------------------------------------
         // 配置
         // ----------------------------------------------------------------
-        std::string process_name_;     // 例如 "launcher" / "core_engine_xxx"
-        std::string log_dir_;          // 默认 "./logs"
-        LogLevel    min_level_;        // 默认 INFO
-        std::size_t max_file_size_;    // 默认 10MB
-        int         max_backup_files_; // 默认 10
-        bool        initialized_;      // 首次 log() 后置 true
-        bool        error_separate_;   // DM_LOG_ERROR_SEPARATE=1 时启用
+        std::string process_name_;
+        std::string log_dir_;
+        LogLevel    min_level_;
+        std::size_t max_file_size_;
+        int         max_backup_files_;
+        bool        initialized_;
+        bool        error_separate_;
 
         // ----------------------------------------------------------------
         // 多文件句柄缓存
         //
-        // key   = 文件名（不含目录），如 "launcher.log"
-        //        或 "core_engine_xxx.plugin_yyy.log"
+        // key   = 文件名（不含目录）
         // value = 输出流 + 该文件自上次检查以来的累计写入字节
-        //
-        // 由 mutex_ 保护。
         // ----------------------------------------------------------------
         struct StreamInfo {
             std::ofstream stream;
@@ -141,32 +149,17 @@ namespace dream_machine {
         std::string formatMessage(LogLevel level, const char* file, int line,
                                   const std::string& msg) const;
 
-        // 计算当前线程主日志文件名（含 ".log"），如 "launcher.log"
         std::string currentFilename() const;
-
-        // 由主日志文件名推导 ERROR 独立文件名
-        //   "launcher.log" → "launcher.error.log"
-        //   "core_engine_x.plugin_y.log" → "core_engine_x.plugin_y.error.log"
         std::string errorFilename(const std::string& main_filename) const;
 
-        // 获取（必要时创建）指定文件的流，返回指针；失败返回 nullptr
         std::ofstream* getOrOpenStream(const std::string& filename);
-
-        // 检查文件大小并在必要时轮转
         void rotateIfNeeded(const std::string& filename, StreamInfo& info);
 
-        // 确保 logs/ 目录存在
         void ensureLogDirectoryExists();
 
-        // 将指定文件归档到 logs/crashes/，reason_suffix 附加到归档文件名
         void archiveLogFile(const std::string& filename);
-
-        // 清理 logs/crashes/ 中的旧归档，按进程基名分组保留最新 N 个
         void cleanupOldCrashes();
 
-        // 计算进程基名（去掉 session_id 后缀）
-        //   "launcher"              → "launcher"
-        //   "core_engine_abc123"    → "core_engine"
         std::string processBaseName() const;
     };
 
@@ -196,7 +189,14 @@ namespace dream_machine {
 
 } // namespace dream_machine
 
-#define LOG_INFO(msg)    dream_machine::Logger::instance().log(dream_machine::LogLevel::INFO, __FILE__, __LINE__, msg)
-#define LOG_WARN(msg)    dream_machine::Logger::instance().log(dream_machine::LogLevel::WARN, __FILE__, __LINE__, msg)
-#define LOG_ERROR(msg)   dream_machine::Logger::instance().log(dream_machine::LogLevel::ERR,  __FILE__, __LINE__, msg)
+// ================================================================
+// 便捷宏
+//
+// DBG 级别默认关闭（min_level_ 默认 INFO）。
+// 若需输出，调用 Logger::instance().setMinLevel(LogLevel::DBG)。
+// ================================================================
+#define LOG_DBG(msg)     dream_machine::Logger::instance().log(dream_machine::LogLevel::DBG,   __FILE__, __LINE__, msg)
+#define LOG_INFO(msg)    dream_machine::Logger::instance().log(dream_machine::LogLevel::INFO,  __FILE__, __LINE__, msg)
+#define LOG_WARN(msg)    dream_machine::Logger::instance().log(dream_machine::LogLevel::WARN,  __FILE__, __LINE__, msg)
+#define LOG_ERROR(msg)   dream_machine::Logger::instance().log(dream_machine::LogLevel::ERR,   __FILE__, __LINE__, msg)
 #define LOG_FATAL(msg)   dream_machine::Logger::instance().log(dream_machine::LogLevel::FATAL, __FILE__, __LINE__, msg)
