@@ -16,8 +16,8 @@
 
 using namespace dream_machine;
 using namespace dream_machine::event;
-// 注：阶段 1.7 C4 起不再 using dream_machine::common——
-//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
+// 注：不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 / pathFromRoot 用 common:: 前缀显式调用。
 
 namespace {
 
@@ -28,7 +28,7 @@ namespace {
 //        - g_executor_pipe / g_monitor_pipe 改为 std::shared_ptr<NamedPipe>
 //        - g_session_id 改为线程安全访问
 //      注：执行路径（executor 调用）即使多线程也难以调试，搁置优先。
-//   2. 日志生命周期（阶段 1.5 P1-5）：
+//   2. 日志生命周期：
 //        启动时调用 archiveLastSessionIfDirty() 检测上次异常退出；
 //        正常退出前调用 markCleanExit() 写入标记。
 //        本文件已调整 setProcessName 顺序以配合多实例日志命名。
@@ -38,11 +38,11 @@ EventLoop* g_event_loop = nullptr;
 std::atomic<bool> g_should_stop{false};
 std::string g_session_id;
 
-// 消息分发表（阶段 1.7 C1）
+// 消息分发表
 //
 // monitor 侧：迁移了 1 个 handler（SHUTDOWN）。
 // executor 侧：STEP_* / OP_DONE / OP_ABORT 尚未实现，
-//              保持 TODO 原样，未来实现 A3 时接入。
+//              保持 TODO 原样，未来实现时接入。
 //
 // 回退方式：删除本变量 + registerMonitorMessageHandlers 调用，
 //          并将 processMonitorMessage 恢复为原始 if-else 即可。
@@ -52,14 +52,10 @@ MessageRouter g_monitor_router;
 void registerMonitorMessageHandlers(MessageRouter& router);
 
 // ================================================================
-// monitor 消息 handler 注册（阶段 1.7 C1）
+// monitor 消息 handler 注册
 // ================================================================
 void registerMonitorMessageHandlers(MessageRouter& router) {
     // ---- SHUTDOWN ----
-    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决：
-    //   - 接收方自行决定退出时机，广播方不强制
-    //   - 记录 reason 用于日志区分（peer_exit / user_close / signal）
-    //   - 即使 payload 解析失败也按默认 reason 处理，避免僵死
     router.register_handler(msg_types::SHUTDOWN,
         [](const std::string& payload, void* /*ctx*/) {
             auto shutdown_msg = parseShutdown(payload);
@@ -78,8 +74,6 @@ void registerMonitorMessageHandlers(MessageRouter& router) {
 
 // ================================================================
 // 处理 monitor 消息（回调）
-//
-// 阶段 1.7 C1：走 MessageRouter 分发。
 // ================================================================
 void processMonitorMessage(EventType type, void* user_data) {
     (void)type;
@@ -120,7 +114,6 @@ void processMonitorMessage(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            // ---- 走分发表（阶段 1.7 C1） ----
             if (!g_monitor_router.dispatch(type_str, payload, &monitor_pipe)) {
                 LOG_WARN("Unhandled message type from monitor: " + type_str);
             }
@@ -141,7 +134,7 @@ void processMonitorMessage(EventType type, void* user_data) {
 // ================================================================
 // 处理 executor 消息（回调）
 //
-// 注：executor 侧消息处理尚未实现（A3 任务），保持 TODO 原样。
+// 注：executor 侧消息处理尚未实现，保持 TODO 原样。
 //     未来实现时，可参考 monitor 侧接入 MessageRouter。
 // ================================================================
 void processExecutorMessage(EventType type, void* user_data) {
@@ -213,16 +206,22 @@ void logHeartbeat(EventType type, void* user_data) {
 // ================================================================
 // main 入口
 //
-// 顺序调整说明（阶段 1.5 P1-6）：
-//   先解析命令行参数（无日志），再根据 session_id 设置进程名，
-//   然后才开始日志输出。避免早期日志写入 "core_engine.log" 后
-//   切换到 "core_engine_{session}.log" 造成孤立文件。
+// 路径策略（Step 0 路径修正）：
+//   所有运行时资源基于可执行文件所在目录，不依赖 CWD。
+//
+// 日志生命周期：
+//   core_engine 的顺序较特殊：必须先解析 session_id（决定日志文件名前缀），
+//   再设置进程名，然后才能确定日志目录与归档。
+//   - 启动：解析参数 → setProcessName → setLogDirectory
+//           → archiveLastSessionIfDirty → 开始日志
+//   - 退出：最后一条日志 → markCleanExit → return 0
+//
+// 失败路径（父进程校验、session_id 校验、连接、事件注册失败）不写 .clean_exit：
+// 它们不是正常会话，下次启动时应被识别为异常退出并归档。
 //
 // 日志文件名规则：
 //   session_id 有效 → "core_engine_{session_id}.log"
 //   session_id 缺失 → "core_engine.log"（仅在拒绝运行前记录诊断信息）
-//
-// 阶段 1.7 C1：monitor 侧消息分发表接入（1 个 handler 迁移）
 // ================================================================
 int main(int argc, char* argv[]) {
     // ----- 1. 先解析命令行参数（无日志） -----
@@ -234,25 +233,34 @@ int main(int argc, char* argv[]) {
 
     g_session_id = common::getArgValue(argc, argv, "--session-id");
 
-    // ----- 2. 设置进程名 -----
+    // ----- 2. 设置进程名（依赖 session_id） -----
     if (g_session_id.empty()) {
         Logger::instance().setProcessName("core_engine");
     } else {
         Logger::instance().setProcessName("core_engine_" + g_session_id);
     }
 
-    // ----- 3. 开始日志输出 -----
+    // ----- 3. 设置日志目录（Step 0 路径修正） -----
+    Logger::instance().setLogDirectory(common::pathFromRoot("logs"));
+
+    // ----- 4. 归档检测（本轮补齐） -----
+    const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
+
+    // ----- 5. 开始日志输出 -----
     LOG_INFO("=== Dream Machine Core Engine starting ===");
 
-    // 阶段 1.7 C1：注册 monitor 侧消息 handler（必须在事件循环启动前）
+    if (archived_prev) {
+        LOG_INFO("Previous session logs archived to logs/crashes/");
+    }
+
     registerMonitorMessageHandlers(g_monitor_router);
 
-    // ----- 4. 校验父进程 -----
+    // ----- 6. 校验父进程 -----
     if (!common::verifyParentPid(expected_parent_pid)) {
         return 1;
     }
 
-    // ----- 5. 校验 session_id -----
+    // ----- 7. 校验 session_id -----
     if (g_session_id.empty()) {
         LOG_ERROR("Missing --session-id argument, refusing to run");
         return 1;
@@ -263,7 +271,6 @@ int main(int argc, char* argv[]) {
     // ----- 连接到 executor -----
     std::string executor_pipe_name_str = pipe_names::executor_core();
 
-    // C4 编码 helper（阶段 1.7）
     std::wstring executor_pipe_name = common::utf8ToWide(executor_pipe_name_str);
 
     LOG_INFO("Connecting to executor pipe: " + executor_pipe_name_str);
@@ -279,7 +286,6 @@ int main(int argc, char* argv[]) {
     // ----- 连接到 monitor -----
     std::string monitor_pipe_name_str = pipe_names::monitor_core(g_session_id);
 
-    // C4 编码 helper（阶段 1.7）：同上
     std::wstring monitor_pipe_name = common::utf8ToWide(monitor_pipe_name_str);
 
     LOG_INFO("Connecting to monitor pipe: " + monitor_pipe_name_str);

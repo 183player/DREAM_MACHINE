@@ -1,11 +1,9 @@
 // platform/dm_logger/logger.cpp
-// ================================================================
-// 注意：本文件分两轮输出。
-//   上半（本轮）：构造/析构/配置/生命周期/channel/归档辅助
-//   下半（下一轮）：log() 及写入路径辅助
-// 上半实现完毕后，因 log() 等 8 个函数未实现，链接会失败——符合预期。
-// ================================================================
 #include "logger.h"
+
+#include "signal_bus.h"
+#include "signal_sink.h"
+#include "signal_strings.h"
 
 #include <iostream>
 #include <chrono>
@@ -17,6 +15,7 @@
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
+#include <atomic>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -25,7 +24,7 @@
 namespace dream_machine {
 
 // ================================================================
-// 匿名命名空间：常量、thread_local channel、辅助函数
+// 匿名命名空间：常量、thread_local channel、辅助函数、信号 Adapter
 // ================================================================
 namespace {
 
@@ -60,6 +59,73 @@ std::string makeTimestampForFilename() {
     return oss.str();
 }
 
+// ================================================================
+// 信号级别 → 日志级别映射
+//
+// 一对一映射；语义：
+//   SGL_DEBUG → LogLevel::DBG
+//   SGL_INFO  → LogLevel::INFO
+//   SGL_WARN  → LogLevel::WARN
+//   SGL_ERROR → LogLevel::ERR    （LogLevel 用 ERR 避免 ERROR 宏）
+//   SGL_FATAL → LogLevel::FATAL
+// ================================================================
+LogLevel signal_level_to_log_level(signal::SignalLevel level) {
+    switch (level) {
+        case signal::SignalLevel::SGL_DEBUG: return LogLevel::DBG;
+        case signal::SignalLevel::SGL_INFO:  return LogLevel::INFO;
+        case signal::SignalLevel::SGL_WARN:  return LogLevel::WARN;
+        case signal::SignalLevel::SGL_ERROR: return LogLevel::ERR;
+        case signal::SignalLevel::SGL_FATAL: return LogLevel::FATAL;
+    }
+    return LogLevel::INFO;   // 兜底（穷尽 switch 下不会到达）
+}
+
+// ================================================================
+// LoggerSignalAdapter：Logger 的信号订阅适配器
+//
+// 方案 D 的核心：
+//   - Logger 本身不继承 ISignalSink（logger.h 保持独立）
+//   - 此 Adapter 在 logger.cpp 内部实现 ISignalSink
+//   - Adapter 将 SignalPayload 转字符串后调 Logger::instance().log()
+//
+// 生命周期：
+//   - 匿名命名空间静态对象，main 前构造
+//   - 构造不访问 SignalBus——安全（SignalBus 可能未构造）
+//   - 析构不访问 SignalBus——安全（SignalBus 可能已析构）
+//   - 装配/卸载由 attach_to_signal_bus / detach_from_signal_bus 控制
+// ================================================================
+class LoggerSignalAdapter : public signal::ISignalSink {
+public:
+    void on_signal(const signal::SignalPayload& payload) override {
+        // 1. 级别映射
+        const LogLevel log_level = signal_level_to_log_level(payload.level);
+
+        // 2. 构造消息内容
+        //    格式：[signal:<type>] <description>[ | <detail>]
+        std::string content;
+        content.reserve(64 + payload.description.size() + payload.detail.size());
+        content += "[signal:";
+        content += signal::signal_type_to_string(payload.type);
+        content += "] ";
+        content += payload.description;
+        if (!payload.detail.empty()) {
+            content += " | ";
+            content += payload.detail;
+        }
+
+        // 3. 写入日志
+        //    file/line 传占位 "<signal>" / 0——表示消息来自信号总线
+        //    （formatMessage 当前忽略 file/line；占位便于未来溯源）
+        Logger::instance().log(log_level, "<signal>", 0, content);
+    }
+};
+
+// Adapter 单例（main 前构造；无副作用）
+LoggerSignalAdapter g_signal_adapter;
+
+// 装配状态（幂等保护）
+std::atomic<bool> g_signal_bus_attached{false};
+
 } // namespace
 
 // ================================================================
@@ -75,7 +141,7 @@ Logger::Logger()
     , initialized_(false)
     , error_separate_(false)
 {
-    // DM_LOG_ERROR_SEPARATE=1 时启用 ERROR 独立文件（契约 #10）
+    // DM_LOG_ERROR_SEPARATE=1 时启用 ERROR 独立文件
     const char* env = std::getenv("DM_LOG_ERROR_SEPARATE");
     if (env && std::string(env) == "1") {
         error_separate_ = true;
@@ -163,24 +229,36 @@ void Logger::setMaxBackupFiles(int count) {
 }
 
 // ================================================================
+// 信号总线装配（方案 D）
+//
+// attach / detach 幂等：
+//   - 用 g_signal_bus_attached 原子布尔跟踪状态
+//   - 重复调用无副作用
+//
+// 时序保证：
+//   - attach 中调用 SignalBus::instance() 首次触发其构造
+//   - detach 中调用同上（若 attach 未调用过则 detach 直接返回）
+//   - 各进程 main() 负责配对调用
+// ================================================================
+
+void Logger::attach_to_signal_bus() {
+    if (g_signal_bus_attached.exchange(true)) {
+        return;   // 已 attach
+    }
+    signal::SignalBus::instance().subscribe(&g_signal_adapter);
+}
+
+void Logger::detach_from_signal_bus() {
+    if (!g_signal_bus_attached.exchange(false)) {
+        return;   // 未 attach
+    }
+    signal::SignalBus::instance().unsubscribe(&g_signal_adapter);
+}
+
+// ================================================================
 // 生命周期标记
 // ================================================================
 
-// 检查上次是否正常退出；若异常，则把旧的 {process_name}.log
-// （以及 .error.log，若启用）归档到 logs/crashes/。
-//
-// 归档文件名：crash_{timestamp}_{process_name}[.error].log
-//   例如：crash_20260912_101530_123_launcher.log
-//         crash_20260912_101530_123_launcher.error.log
-//
-// 若 logs/.clean_exit_{process_name} 存在：
-//   - 说明上次正常退出 → 删除标记，返回 false
-//   - 不归档（日志内容已正常收尾）
-//
-// 若标记不存在：
-//   - 检查 {process_name}.log 是否存在
-//     - 存在 → 归档，返回 true
-//     - 不存在（首次启动）→ 不归档，返回 false
 bool Logger::archiveLastSessionIfDirty() {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -200,8 +278,7 @@ bool Logger::archiveLastSessionIfDirty() {
         std::filesystem::path(log_dir_) / (process_name_ + ".log");
 
     if (!std::filesystem::exists(main_log, ec)) {
-        // 首次启动，无日志可归档
-        return false;
+        return false;   // 首次启动，无日志可归档
     }
 
     // 归档主日志
@@ -216,9 +293,7 @@ bool Logger::archiveLastSessionIfDirty() {
         }
     }
 
-    // 清理旧归档
     cleanupOldCrashes();
-
     return true;
 }
 
@@ -233,9 +308,7 @@ void Logger::markCleanExit() {
     std::ofstream marker_file(marker.string());
     if (marker_file.is_open()) {
         marker_file << "clean_exit\n";
-        // ofstream 析构时自动关闭
     }
-    // 写失败不阻塞——fail-fast 语义仅适用于业务故障，日志故障不致命
 }
 
 // ================================================================
@@ -273,18 +346,9 @@ void Logger::ensureLogDirectoryExists() {
     if (!std::filesystem::exists(dir_path)) {
         std::error_code ec;
         std::filesystem::create_directories(dir_path, ec);
-        // 静默失败：写入路径上会再次尝试创建
     }
 }
 
-// 将 log_dir_/{filename} 归档到 log_dir_/crashes/
-//
-// 归档策略：
-//   1. 优先 std::filesystem::rename（同卷原子操作）
-//   2. 失败则 copy_file + remove（跨卷或 rename 被占用）
-//
-// 归档文件名：crash_{timestamp}_{base}.log
-//   其中 base 为 filename 去掉 ".log" 后缀
 void Logger::archiveLogFile(const std::string& filename) {
     std::filesystem::path src = std::filesystem::path(log_dir_) / filename;
 
@@ -326,18 +390,8 @@ void Logger::archiveLogFile(const std::string& filename) {
         std::error_code rm_ec;
         std::filesystem::remove(src, rm_ec);
     }
-    // 若 copy 也失败：保留原文件不动，静默返回
 }
 
-// 清理 logs/crashes/ 中的旧归档。
-//
-// 分组策略：按"进程基名"分组（契约 #6）
-//   - crash_TS_launcher.log          → 组 "launcher"
-//   - crash_TS_core_engine_abc.log   → 组 "core_engine_abc"
-// 每组保留最新 MAX_CRASH_BACKUPS_PER_PROCESS 个，其余删除。
-//
-// 时间戳格式 YYYYMMDD_HHMMSS_mmm 保证字典序 == 时间序，
-// 因此按 filename 字符串排序即可。
 void Logger::cleanupOldCrashes() {
     std::filesystem::path crashes_dir =
         std::filesystem::path(log_dir_) / CRASH_DIR_NAME;
@@ -347,7 +401,6 @@ void Logger::cleanupOldCrashes() {
         return;
     }
 
-    // 分组：base → 该 base 下的所有归档 entry
     std::unordered_map<std::string,
                        std::vector<std::filesystem::directory_entry>> groups;
 
@@ -357,22 +410,17 @@ void Logger::cleanupOldCrashes() {
 
         const std::string name = entry.path().filename().string();
 
-        // 文件名格式：crash_YYYYMMDD_HHMMSS_mmm_{base}.log
-        // 逐段定位：crash_ / YYYYMMDD / HHMMSS / mmm / base
         if (name.size() < 20) continue;
         if (name.compare(0, 6, "crash_") != 0) continue;
 
-        // 跳过 "crash_" 后的前 4 个 '_' 分隔符
-        // 分段：YYYYMMDD(8) '_' HHMMSS(6) '_' mmm(3) '_' base
-        std::size_t p1 = 6 + 8;        // YYYYMMDD 结束
+        std::size_t p1 = 6 + 8;
         if (p1 >= name.size() || name[p1] != '_') continue;
-        std::size_t p2 = p1 + 1 + 6;   // HHMMSS 结束
+        std::size_t p2 = p1 + 1 + 6;
         if (p2 >= name.size() || name[p2] != '_') continue;
-        std::size_t p3 = p2 + 1 + 3;   // mmm 结束
+        std::size_t p3 = p2 + 1 + 3;
         if (p3 >= name.size() || name[p3] != '_') continue;
 
         std::string base = name.substr(p3 + 1);
-        // 去掉末尾 ".log"
         constexpr const char* DOT_LOG = ".log";
         constexpr std::size_t DOT_LOG_LEN = 4;
         if (base.size() > DOT_LOG_LEN &&
@@ -383,20 +431,17 @@ void Logger::cleanupOldCrashes() {
         groups[base].push_back(entry);
     }
 
-    // 逐组清理
     for (auto& [base, entries] : groups) {
         if (entries.size() <= static_cast<std::size_t>(MAX_CRASH_BACKUPS_PER_PROCESS)) {
             continue;
         }
 
-        // 按 filename 字典序排序（时间戳保证 == 时间序）
         std::sort(entries.begin(), entries.end(),
                   [](const std::filesystem::directory_entry& a,
                      const std::filesystem::directory_entry& b) {
                       return a.path().filename() < b.path().filename();
                   });
 
-        // 删除最旧的若干，保留最新 MAX_CRASH_BACKUPS_PER_PROCESS 个
         const std::size_t to_remove =
             entries.size() - static_cast<std::size_t>(MAX_CRASH_BACKUPS_PER_PROCESS);
         for (std::size_t i = 0; i < to_remove; ++i) {
@@ -406,12 +451,6 @@ void Logger::cleanupOldCrashes() {
     }
 }
 
-// 计算进程基名（去掉 core_engine 的 session 后缀）
-//   "launcher"           → "launcher"
-//   "core_engine_abc123" → "core_engine"
-//
-// 目前 cleanupOldCrashes 使用归档文件名中的 base 字段进行分组，
-// 不依赖本函数；本函数保留为未来"按进程基名统一限流"的接口。
 std::string Logger::processBaseName() const {
     constexpr const char* PREFIX = "core_engine_";
     constexpr std::size_t PREFIX_LEN = 12;
@@ -421,6 +460,7 @@ std::string Logger::processBaseName() const {
     }
     return process_name_;
 }
+
 // ================================================================
 // 核心日志接口
 // ================================================================
@@ -440,7 +480,6 @@ void Logger::log(LogLevel level, const char* file, int line, const std::string& 
     const std::string formatted = formatMessage(level, file, line, msg);
     const std::string main_filename = currentFilename();
 
-    // 写入单个文件：打开（必要时）→ 轮转检查 → 写入 → 累计字节
     auto write_to = [&](const std::string& filename) {
         if (getOrOpenStream(filename) == nullptr) {
             return;
@@ -456,16 +495,12 @@ void Logger::log(LogLevel level, const char* file, int line, const std::string& 
         }
     };
 
-    // ---- 主日志 ----
     write_to(main_filename);
 
-    // ---- ERROR 独立文件（DM_LOG_ERROR_SEPARATE=1 时启用）----
-    // 写入失败静默：不调用 LOG_WARN（避免递归）
     if (error_separate_ && level >= LogLevel::ERR) {
         write_to(errorFilename(main_filename));
     }
 
-    // ---- 控制台输出（保留原有行为）----
 #ifndef NDEBUG
     std::cout << formatted << std::flush;
 #else
@@ -481,9 +516,10 @@ void Logger::log(LogLevel level, const char* file, int line, const std::string& 
 
 std::string Logger::levelToString(LogLevel level) const {
     switch (level) {
+        case LogLevel::DBG:   return "DEBUG";   // 对外显示全名（与 ERR→"ERROR" 一致）
         case LogLevel::INFO:  return "INFO";
         case LogLevel::WARN:  return "WARN";
-        case LogLevel::ERR:   return "ERROR";   // 对外显示仍为 ERROR
+        case LogLevel::ERR:   return "ERROR";
         case LogLevel::FATAL: return "FATAL";
         default:              return "UNKNOWN";
     }
@@ -513,7 +549,6 @@ std::string Logger::currentTimestamp() const {
 
 std::string Logger::formatMessage(LogLevel level, const char* file, int line,
                                   const std::string& msg) const {
-    // 注：file / line 参数保留以匹配调用宏，当前未使用
     (void)file;
     (void)line;
 
@@ -529,9 +564,6 @@ std::string Logger::formatMessage(LogLevel level, const char* file, int line,
 // 私有辅助：文件命名
 // ================================================================
 
-// 当前线程主日志文件名：
-//   channel 为空 → "{process_name}.log"
-//   channel 非空 → "{process_name}.{channel}.log"
 std::string Logger::currentFilename() const {
     const std::string& channel = t_current_channel;
     if (channel.empty()) {
@@ -540,9 +572,6 @@ std::string Logger::currentFilename() const {
     return process_name_ + "." + channel + ".log";
 }
 
-// 从主日志文件名推导 ERROR 独立文件名：
-//   "launcher.log"                     → "launcher.error.log"
-//   "core_engine_x.plugin_y.log"       → "core_engine_x.plugin_y.error.log"
 std::string Logger::errorFilename(const std::string& main_filename) const {
     constexpr const char* DOT_LOG = ".log";
     constexpr std::size_t DOT_LOG_LEN = 4;
@@ -553,7 +582,6 @@ std::string Logger::errorFilename(const std::string& main_filename) const {
         return main_filename.substr(0, main_filename.size() - DOT_LOG_LEN)
                + ".error.log";
     }
-    // 无 .log 后缀时的兜底
     return main_filename + ".error";
 }
 
@@ -561,10 +589,6 @@ std::string Logger::errorFilename(const std::string& main_filename) const {
 // 私有辅助：流管理
 // ================================================================
 
-// 获取指定文件的流；不存在则创建并打开（append 模式）。
-// 返回 nullptr 表示打开失败。
-//
-// 注：调用方需持有 mutex_。
 std::ofstream* Logger::getOrOpenStream(const std::string& filename) {
     auto it = streams_.find(filename);
 
@@ -590,27 +614,11 @@ std::ofstream* Logger::getOrOpenStream(const std::string& filename) {
 // 私有辅助：轮转
 // ================================================================
 
-// 文件大小触发式轮转。
-//
-// 触发条件（双阈值）：
-//   1. 自上次检查以来累计写入 ≥ CHECK_INTERVAL_BYTES（避免频繁 file_size）
-//   2. 当前文件大小 ≥ max_file_size_
-//
-// 轮转命名：
-//   {filename}       → {filename}.1
-//   {filename}.1     → {filename}.2
-//   ...
-//   {filename}.N-1   → {filename}.N
-//   {filename}.N     → 删除（N = max_backup_files_）
-//
-// max_backup_files_ ≤ 0 时禁用轮转（文件无限增长）。
-//
-// 注：调用方需持有 mutex_，且 info.stream 已打开。
 void Logger::rotateIfNeeded(const std::string& filename, StreamInfo& info) {
     constexpr std::size_t CHECK_INTERVAL_BYTES = 512 * 1024;  // 512KB
 
     if (max_backup_files_ <= 0) {
-        return;  // 禁用轮转
+        return;
     }
 
     if (info.bytes_since_check < CHECK_INTERVAL_BYTES) {
@@ -628,20 +636,16 @@ void Logger::rotateIfNeeded(const std::string& filename, StreamInfo& info) {
         return;
     }
 
-    // ---- 执行轮转 ----
-    // 1. 关闭流（Windows 上被占用的文件无法 rename）
     if (info.stream.is_open()) {
         info.stream.flush();
         info.stream.close();
     }
 
-    // 2. 删除最大编号备份
     std::filesystem::path max_backup =
         std::filesystem::path(log_dir_) /
         (filename + "." + std::to_string(max_backup_files_));
     std::filesystem::remove(max_backup, ec);
 
-    // 3. 从大到小 rename：.N-1 → .N, ..., .1 → .2
     for (int i = max_backup_files_ - 1; i >= 1; --i) {
         std::filesystem::path src =
             std::filesystem::path(log_dir_) /
@@ -651,17 +655,14 @@ void Logger::rotateIfNeeded(const std::string& filename, StreamInfo& info) {
             (filename + "." + std::to_string(i + 1));
         ec.clear();
         std::filesystem::rename(src, dst, ec);
-        // src 不存在时忽略（尚未轮转过那么多次）
     }
 
-    // 4. 当前文件 → .1
     std::filesystem::path dst1 =
         std::filesystem::path(log_dir_) / (filename + ".1");
     ec.clear();
     std::filesystem::rename(path, dst1, ec);
 
-    // 5. 重开当前文件（追加模式，必然创建新文件）
     info.stream.open(path.string(), std::ios::out | std::ios::app);
-    // 若重开失败，后续 log() 的 is_open() 检查会跳过写入
 }
+
 } // namespace dream_machine

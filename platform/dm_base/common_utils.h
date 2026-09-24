@@ -76,7 +76,7 @@ inline bool verifyParentPid(DWORD expected_parent_pid) {
 //       在调用 CreateNamedPipeW / CreateFileW 等宽字符 API 前，
 //       需要先做转换。
 //
-// 保守设计（依据阶段 1.7 保守规划）：
+// 保守设计：
 //   - 仅提供两个函数，不引入其他编码相关能力
 //   - 转换失败返回空字符串（调用方按"无效输入"处理）
 //   - 不使用 std::filesystem::path 互转（当前无此需求）
@@ -141,7 +141,64 @@ inline std::string wideToUtf8(const std::wstring& wide_str) {
 }
 
 // ================================================================
-// request_id 统一生成器（阶段 1.7 B2）
+// 应用根目录与路径解析
+//
+// 背景：所有运行时资源（logs/ / plugins/ / data/）应位于可执行文件
+//       同级目录，保证 bin/ 整体挪走后路径仍正确。
+//       不能依赖当前工作目录（CWD），因为从其他目录启动时 CWD 会变。
+//
+// 实现：使用 Win32 GetModuleFileNameW 获取 exe 绝对路径，不依赖 Qt
+//       或 CWD。任何时机（含 QApplication 创建前）调用都安全。
+//
+// 保守设计：
+//   - 只提供两个函数（根路径 + 相对路径拼接）
+//   - 失败返回空字符串，由调用方处理
+//   - 不做规范化（如 .. 折叠）—— 当前无此需求
+// ================================================================
+
+// 获取应用根目录（可执行文件所在目录，绝对路径，UTF-8）
+// 失败时返回空字符串
+inline std::string getAppRootPath() {
+    wchar_t buffer[MAX_PATH];
+    const DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        LOG_ERROR("GetModuleFileNameW failed: " + std::to_string(GetLastError()));
+        return {};
+    }
+
+    std::wstring full_path(buffer, len);
+    const size_t pos = full_path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) {
+        LOG_ERROR("No path separator in exe path");
+        return {};
+    }
+    return wideToUtf8(full_path.substr(0, pos));
+}
+
+// 拼接应用根目录下的相对路径
+// relative 为空时返回根目录本身
+// 根目录获取失败时返回空字符串
+inline std::string pathFromRoot(const std::string& relative) {
+    std::string root = getAppRootPath();
+    if (root.empty()) {
+        return {};
+    }
+    if (relative.empty()) {
+        return root;
+    }
+
+    // 规范化分隔符（避免出现 "\\" 与 "/" 混用）
+    if (root.back() == '\\' || root.back() == '/') {
+        root.pop_back();
+    }
+    if (relative.front() == '\\' || relative.front() == '/') {
+        return root + relative;
+    }
+    return root + "\\" + relative;
+}
+
+// ================================================================
+// request_id 统一生成器
 //
 // 用途：为"请求-响应关联"场景提供进程内唯一 ID。例如：
 //   - 未来的 REQUEST_ENGINE 会话创建请求需关联响应

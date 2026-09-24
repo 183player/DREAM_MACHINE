@@ -7,11 +7,15 @@
 #include "session_state_manager.h"
 #include "plugin_loader.h"
 #include "status_provider.h"
+#include "theme_manager.h"
 #include "common_utils.h"
 
 #include <QApplication>
+#include <QGuiApplication>
+#include <QScreen>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QQuickStyle>
 #include <QTimer>
 #include <QUrl>
 #include <QObject>
@@ -34,17 +38,17 @@
 
 using namespace dream_machine;
 using namespace dream_machine::gui;
-// 注：阶段 1.7 C4 起不再 using dream_machine::common——
-//     新增的 utf8ToWide / wideToUtf8 用 common:: 前缀显式调用。
+// 注：不再 using dream_machine::common——
+//     新增的 utf8ToWide / wideToUtf8 / pathFromRoot 用 common:: 前缀显式调用。
 
 // ================================================================
 // 未来重审点（依据 DREAM_MACHINE_CONCURRENCY_MODEL_BOUNDARY 专家裁决 Q4）：
 //
 //   1. 若 GUI 引入 QJSEngine 工作线程（插件脚本执行），需重审：
 //        - Qt 对象访问必须通过 QMetaObject::invokeMethod 跨线程；
-//        - Logger 的 thread_local channel 保证各线程日志隔离（Q5 已裁决）；
+//        - Logger 的 thread_local channel 保证各线程日志隔离；
 //        - g_pipe 改 std::shared_ptr<NamedPipe> 保证生命周期；
-//   2. Logger 的 mutex_ 保留（Q5 裁决）——即使引入线程也无需重构 Logger 本身。
+//   2. Logger 的 mutex_ 保留——即使引入线程也无需重构 Logger 本身。
 //
 //   当前单线程 Qt 事件循环 + 50ms QTimer 轮询模型下无需改造。
 // ================================================================
@@ -57,18 +61,13 @@ static QPointer<SessionStateManager> g_sessionManager;
 static QPointer<QQmlApplicationEngine> g_engine;
 static std::unique_ptr<PluginLoader> g_pluginLoader;
 static QPointer<StatusProvider> g_statusProvider;
+static std::unique_ptr<ThemeManager> g_themeManager;
 static QPointer<QObject> g_placeholderWindow;
 static std::unique_ptr<QTimer> g_timeoutTimer;
 static std::unique_ptr<QTimer> g_showPlaceholderTimer;
 static std::atomic<bool> g_should_stop{false};
 
-// 消息分发表（阶段 1.7 C1）
-//
-// 迁移了全部 4 个 handler（SHUTDOWN / INIT_LIST / SESSION_STATE_UPDATE /
-// INIT_SESSION_LIST）。gui 无 fallback 特例。
-//
-// 回退方式：删除本变量 + registerMessageHandlers 调用，
-//          并将 pollPipe 恢复为原始 if-else 即可。
+// 消息分发表
 static MessageRouter g_message_router;
 
 // ================================================================
@@ -86,50 +85,202 @@ bool isDevMode() {
     return dev_mode && std::string(dev_mode) == "1";
 }
 
-QVariantMap loadGlobalParams() {
+// ================================================================
+// 读取 JSON 文件 → QVariantMap
+// 失败返回空 map
+// ================================================================
+QVariantMap readJsonFile(const QString& path) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    QByteArray data = file.readAll();
+    file.close();
+
+    QJsonParseError error;
+    QJsonDocument doc = QJsonDocument::fromJson(data, &error);
+    if (error.error != QJsonParseError::NoError || !doc.isObject()) {
+        LOG_WARN("Failed to parse JSON: " + path.toStdString() +
+                 " (" + error.errorString().toStdString() + ")");
+        return {};
+    }
+    return doc.object().toVariantMap();
+}
+
+// ================================================================
+// 深度合并两个 QVariantMap
+//
+// 规则：
+//   - override 中的键覆盖 base 中的同名键
+//   - 若双方的值都是 map，递归合并
+//   - 否则 override 直接覆盖
+// ================================================================
+QVariantMap deepMergeMap(const QVariantMap& base, const QVariantMap& override) {
+    QVariantMap result = base;
+
+    for (auto it = override.begin(); it != override.end(); ++it) {
+        const QString& key = it.key();
+        const QVariant& val = it.value();
+
+        if (val.canConvert<QVariantMap>() &&
+            result.value(key).canConvert<QVariantMap>()) {
+            QVariantMap merged = deepMergeMap(result.value(key).toMap(),
+                                              val.toMap());
+            result[key] = merged;
+        } else {
+            result[key] = val;
+        }
+    }
+    return result;
+}
+
+// ================================================================
+// 从系统模板中提取指定模式的颜色（带回退）
+// ================================================================
+QVariantMap extractColorsForMode(const QVariantMap& sys_template,
+                                 const QString& mode) {
+    QVariantMap theme = sys_template.value("theme").toMap();
+    if (!theme.isEmpty()) {
+        QVariantMap modes = theme.value("modes").toMap();
+
+        QVariantMap mode_cfg = modes.value(mode).toMap();
+        QVariantMap colors = mode_cfg.value("colors").toMap();
+        if (!colors.isEmpty()) {
+            return colors;
+        }
+
+        QString default_mode = theme.value("default_mode").toString();
+        if (!default_mode.isEmpty() && default_mode != mode) {
+            QVariantMap default_cfg = modes.value(default_mode).toMap();
+            colors = default_cfg.value("colors").toMap();
+            if (!colors.isEmpty()) {
+                LOG_WARN("Theme mode '" + mode.toStdString() +
+                         "' not found, falling back to default_mode '" +
+                         default_mode.toStdString() + "'");
+                return colors;
+            }
+        }
+
+        for (auto it = modes.begin(); it != modes.end(); ++it) {
+            colors = it.value().toMap().value("colors").toMap();
+            if (!colors.isEmpty()) {
+                LOG_WARN("Theme mode '" + mode.toStdString() +
+                         "' and default_mode not found, using mode '" +
+                         it.key().toStdString() + "'");
+                return colors;
+            }
+        }
+    }
+
+    QVariantMap legacy_colors = sys_template.value("colors").toMap();
+    if (!legacy_colors.isEmpty()) {
+        return legacy_colors;
+    }
+
+    return {};
+}
+
+// ================================================================
+// 计算启动时的窗口尺寸（主窗口 + 占位窗口）
+//
+// 主窗口初始尺寸：
+//   w = clamp(screen_w × ratio_w, min_w, max_w)
+//   h = clamp(screen_h × ratio_h, min_h, max_h)
+//   用户可后续拉伸；min_window_* 是最小尺寸约束（QML 侧 minWidth/minHeight）
+//
+// 占位窗口尺寸：
+//   scale = clamp(screen_w / ref_w, scale_min, scale_max)
+//   w = placeholder_width_base × scale
+//   h = placeholder_height_base × scale
+//
+// 说明：
+//   QScreen::availableGeometry() 返回逻辑像素（已考虑系统 DPI 缩放）。
+//   因此无需额外处理 DPI。
+//
+// 注入字段：
+//   layout.initial_window_width   → 主窗口初始宽
+//   layout.initial_window_height  → 主窗口初始高
+//   layout.placeholder_width      → 占位窗口宽
+//   layout.placeholder_height     → 占位窗口高
+// ================================================================
+void computeLayoutDimensions(QVariantMap& global_params) {
+    QVariantMap layout = global_params.value("layout").toMap();
+    if (layout.isEmpty()) {
+        LOG_WARN("computeLayoutDimensions: layout is empty, skipping");
+        return;
+    }
+
+    // ----- 读取基准值（含兜底默认） -----
+    const int min_w         = layout.value("min_window_width", 800).toInt();
+    const int min_h         = layout.value("min_window_height", 600).toInt();
+    const double ratio_w    = layout.value("initial_window_width_ratio", 0.6).toDouble();
+    const double ratio_h    = layout.value("initial_window_height_ratio", 0.7).toDouble();
+    const int max_w         = layout.value("initial_window_max_width", 1600).toInt();
+    const int max_h         = layout.value("initial_window_max_height", 1000).toInt();
+
+    const int ph_base_w     = layout.value("placeholder_width_base", 360).toInt();
+    const int ph_base_h     = layout.value("placeholder_height_base", 150).toInt();
+    const int ph_ref_w      = layout.value("placeholder_scale_reference_width", 1920).toInt();
+    const double ph_min     = layout.value("placeholder_scale_min", 1.0).toDouble();
+    const double ph_max     = layout.value("placeholder_scale_max", 1.5).toDouble();
+
+    // ----- 获取屏幕信息 -----
+    QScreen* screen = QGuiApplication::primaryScreen();
+    if (!screen) {
+        LOG_WARN("computeLayoutDimensions: no primary screen, using min sizes");
+        layout["initial_window_width"]  = min_w;
+        layout["initial_window_height"] = min_h;
+        layout["placeholder_width"]     = ph_base_w;
+        layout["placeholder_height"]    = ph_base_h;
+        global_params["layout"] = layout;
+        return;
+    }
+
+    const QRect geo = screen->availableGeometry();
+    const int screen_w = geo.width();
+    const int screen_h = geo.height();
+
+    // ----- 计算主窗口初始尺寸 -----
+    int initial_w = static_cast<int>(screen_w * ratio_w);
+    int initial_h = static_cast<int>(screen_h * ratio_h);
+
+    if (initial_w < min_w) initial_w = min_w;
+    if (initial_w > max_w) initial_w = max_w;
+    if (initial_h < min_h) initial_h = min_h;
+    if (initial_h > max_h) initial_h = max_h;
+
+    layout["initial_window_width"]  = initial_w;
+    layout["initial_window_height"] = initial_h;
+
+    // ----- 计算占位窗口尺寸 -----
+    double scale = (ph_ref_w > 0)
+                   ? static_cast<double>(screen_w) / ph_ref_w
+                   : 1.0;
+    if (scale < ph_min) scale = ph_min;
+    if (scale > ph_max) scale = ph_max;
+
+    int ph_w = static_cast<int>(ph_base_w * scale);
+    int ph_h = static_cast<int>(ph_base_h * scale);
+
+    layout["placeholder_width"]  = ph_w;
+    layout["placeholder_height"] = ph_h;
+
+    global_params["layout"] = layout;
+
+    LOG_INFO("Layout dimensions computed: screen=" +
+             std::to_string(screen_w) + "x" + std::to_string(screen_h) +
+             ", initial_window=" + std::to_string(initial_w) + "x" + std::to_string(initial_h) +
+             ", placeholder=" + std::to_string(ph_w) + "x" + std::to_string(ph_h));
+}
+
+// ================================================================
+// 硬编码兜底（系统模板 + dev 模式都读不到时使用）
+//
+// 含 layout 基准值——computeLayoutDimensions 依赖这些字段计算。
+// ================================================================
+QVariantMap buildHardcodedDefaults() {
     QVariantMap result;
 
-    QString config_path = "plugins/system/dream_machine_default/config/global_params.json";
-    if (QFile::exists(config_path)) {
-        QFile file(config_path);
-        if (file.open(QIODevice::ReadOnly)) {
-            QByteArray data = file.readAll();
-            file.close();
-            QJsonParseError error;
-            QJsonDocument doc = QJsonDocument::fromJson(data, &error);
-            if (error.error == QJsonParseError::NoError && doc.isObject()) {
-                result = doc.object().toVariantMap();
-                LOG_INFO("global_params.json loaded from: " + config_path.toStdString());
-                return result;
-            }
-        }
-    }
-
-    if (isDevMode()) {
-        QString project_root = QDir::currentPath();
-        QDir proj_dir(project_root);
-        if (proj_dir.dirName() == "bin") {
-            proj_dir.cdUp();
-            proj_dir.cdUp();
-        }
-        config_path = proj_dir.filePath("src/default_plugin/config/global_params.json");
-        if (QFile::exists(config_path)) {
-            QFile file(config_path);
-            if (file.open(QIODevice::ReadOnly)) {
-                QByteArray data = file.readAll();
-                file.close();
-                QJsonParseError error;
-                QJsonDocument doc = QJsonDocument::fromJson(data, &error);
-                if (error.error == QJsonParseError::NoError && doc.isObject()) {
-                    result = doc.object().toVariantMap();
-                    LOG_INFO("global_params.json loaded from (dev): " + config_path.toStdString());
-                    return result;
-                }
-            }
-        }
-    }
-
-    LOG_WARN("global_params.json not found, using minimal defaults");
     QVariantMap colors;
     colors["background"] = "#F0F0F0";
     colors["background_alt"] = "#E8E8E8";
@@ -179,6 +330,15 @@ QVariantMap loadGlobalParams() {
     layout["status_bar_height"] = 24;
     layout["min_window_width"] = 800;
     layout["min_window_height"] = 600;
+    layout["initial_window_width_ratio"] = 0.6;
+    layout["initial_window_height_ratio"] = 0.7;
+    layout["initial_window_max_width"] = 1600;
+    layout["initial_window_max_height"] = 1000;
+    layout["placeholder_width_base"] = 360;
+    layout["placeholder_height_base"] = 150;
+    layout["placeholder_scale_reference_width"] = 1920;
+    layout["placeholder_scale_min"] = 1.0;
+    layout["placeholder_scale_max"] = 1.5;
     result["layout"] = layout;
 
     QVariantMap animation;
@@ -187,6 +347,94 @@ QVariantMap loadGlobalParams() {
     animation["duration_long"] = 500;
     animation["easing_type"] = "easeInOut";
     result["animation"] = animation;
+
+    return result;
+}
+
+// ================================================================
+// 加载全局参数（供 QML 使用的扁平结构）
+//
+// 加载顺序：
+//   1. 系统模板（生产路径；dev 路径回退）
+//   2. 用户偏好（data/theme_preferences.json，可能不存在）
+//   3. 主题模式：用户主题模式 > 系统 default_mode > "light"
+//   4. 从系统模板提取对应模式的基础 colors（带回退）
+//   5. 深度合并（用户偏好优先）每个字段
+//   6. 计算窗口尺寸（computeLayoutDimensions）
+//   7. 返回 { colors, fonts, spacing, layout, animation }
+// ================================================================
+QVariantMap loadGlobalParams() {
+    // ----- 1. 读系统模板 -----
+    QVariantMap sys_template;
+
+    {
+        QString sys_path = QString::fromStdString(
+            common::pathFromRoot("plugins/system/dream_machine_default/config/global_params.json"));
+        sys_template = readJsonFile(sys_path);
+        if (!sys_template.isEmpty()) {
+            LOG_INFO("global_params.json loaded from: " + sys_path.toStdString());
+        }
+    }
+
+    if (sys_template.isEmpty() && isDevMode()) {
+        QString project_root = QDir::currentPath();
+        QDir proj_dir(project_root);
+        if (proj_dir.dirName() == "bin") {
+            proj_dir.cdUp();
+            proj_dir.cdUp();
+        }
+        QString dev_path = proj_dir.filePath("src/default_plugin/config/global_params.json");
+        sys_template = readJsonFile(dev_path);
+        if (!sys_template.isEmpty()) {
+            LOG_INFO("global_params.json loaded from (dev): " + dev_path.toStdString());
+        }
+    }
+
+    // ----- 完全读不到 → 硬编码兜底 + 计算尺寸 -----
+    if (sys_template.isEmpty()) {
+        LOG_WARN("System template not found, using hardcoded defaults");
+        QVariantMap result = buildHardcodedDefaults();
+        computeLayoutDimensions(result);
+        return result;
+    }
+
+    // ----- 2. 读用户偏好 -----
+    QString user_path = QString::fromStdString(
+        common::pathFromRoot("data/theme_preferences.json"));
+    QVariantMap user_prefs = readJsonFile(user_path);
+    if (!user_prefs.isEmpty()) {
+        LOG_INFO("theme_preferences.json loaded from: " + user_path.toStdString());
+    }
+
+    // ----- 3. 确定主题模式 -----
+    QString mode = user_prefs.value("theme_mode").toString();
+    if (mode.isEmpty()) {
+        QVariantMap theme = sys_template.value("theme").toMap();
+        mode = theme.value("default_mode").toString();
+    }
+    if (mode.isEmpty()) {
+        mode = "light";
+    }
+    LOG_INFO("Theme mode resolved to: " + mode.toStdString());
+
+    // ----- 4. 提取基础 colors（带回退） -----
+    QVariantMap base_colors = extractColorsForMode(sys_template, mode);
+
+    // ----- 5. 深度合并每类字段 -----
+    QVariantMap result;
+    result["colors"]    = deepMergeMap(base_colors,
+                                       user_prefs.value("colors").toMap());
+    result["fonts"]     = deepMergeMap(sys_template.value("fonts").toMap(),
+                                       user_prefs.value("fonts").toMap());
+    result["spacing"]   = deepMergeMap(sys_template.value("spacing").toMap(),
+                                       user_prefs.value("spacing").toMap());
+    result["layout"]    = deepMergeMap(sys_template.value("layout").toMap(),
+                                       user_prefs.value("layout").toMap());
+    result["animation"] = deepMergeMap(sys_template.value("animation").toMap(),
+                                       user_prefs.value("animation").toMap());
+
+    // ----- 6. 计算窗口尺寸（注入 initial_window_* / placeholder_*） -----
+    computeLayoutDimensions(result);
 
     return result;
 }
@@ -299,19 +547,9 @@ void handleSessionStateUpdate(const std::string& payload) {
 }
 
 // ================================================================
-// 消息 handler 注册（阶段 1.7 C1）
-//
-// 注册 4 个 handler 到全局 router。
-// gui handler 均通过 g_pipe 全局直接访问管道，不使用 ctx 参数。
-//
-// 注：这些 handler 在 Qt 主线程中执行（由 pollPipe 通过 QTimer 触发），
-//     可安全访问 Qt 对象（g_pluginLoader / g_statusProvider / g_sessionManager）。
+// 消息 handler 注册
 // ================================================================
 void registerMessageHandlers(MessageRouter& router) {
-    // ---- SHUTDOWN ----
-    // 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决 Q4：
-    //   直接 QApplication::quit()，不弹确认框
-    //   reason 仅用于日志区分，不影响退出行为
     router.register_handler(msg_types::SHUTDOWN,
         [](const std::string& payload, void* /*ctx*/) {
             auto shutdown_msg = parseShutdown(payload);
@@ -326,19 +564,16 @@ void registerMessageHandlers(MessageRouter& router) {
             QApplication::quit();
         });
 
-    // ---- INIT_LIST ----
     router.register_handler(msg_types::INIT_LIST,
         [](const std::string& payload, void* /*ctx*/) {
             handleInitList(payload);
         });
 
-    // ---- SESSION_STATE_UPDATE ----
     router.register_handler(msg_types::SESSION_STATE_UPDATE,
         [](const std::string& payload, void* /*ctx*/) {
             handleSessionStateUpdate(payload);
         });
 
-    // ---- INIT_SESSION_LIST ----
     router.register_handler(msg_types::INIT_SESSION_LIST,
         [](const std::string& payload, void* /*ctx*/) {
             handleInitSessionList(payload);
@@ -347,13 +582,6 @@ void registerMessageHandlers(MessageRouter& router) {
 
 // ================================================================
 // 管道轮询（QTimer 50ms 触发）
-//
-// 阶段 1.7 C1：走 MessageRouter 分发。
-// 依据 DREAM_MACHINE_SHUTDOWN_COORDINATION 裁决 Q4-Q7：
-//   - Q4: 收到 SHUTDOWN 直接 QApplication::quit()（由 handler 处理）
-//   - Q5: 日志由 Logger 内部每次写入即 flush
-//   - Q6: pollTimer 由 QApplication::exec() 返回后的 main() 统一停止
-//   - Q7: readLine(3000) 保持不动
 // ================================================================
 void pollPipe() {
     if (!g_pipe || g_should_stop) {
@@ -390,8 +618,6 @@ void pollPipe() {
 
             std::string type, cmd, payload;
             if (parseBaseMessage(message, type, cmd, payload)) {
-                // ---- 走分发表（阶段 1.7 C1） ----
-                // gui handler 不需要 ctx（通过 g_pipe 全局直接访问）
                 if (!g_message_router.dispatch(type, payload, nullptr)) {
                     LOG_WARN("Unhandled message type: " + type);
                 }
@@ -428,20 +654,35 @@ void onTimeout() {
 // ================================================================
 // main 入口
 //
-// 日志生命周期（阶段 1.5 P1-5）：
-//   - 启动：setProcessName → archiveLastSessionIfDirty → 开始日志
+// 路径策略（Step 0 路径修正）：
+//   所有运行时资源基于可执行文件所在目录，不依赖 CWD。
+//
+// 日志生命周期：
+//   - 启动：setProcessName → setLogDirectory → archiveLastSessionIfDirty → 开始日志
 //   - 退出：最后一条日志 → markCleanExit → return 0
 //
-// QApplication::exec() 返回代表 Qt 事件循环结束（用户关闭窗口或
-// SHUTDOWN 触发），均视为正常退出；exec() 返回值不影响标记写入。
+// QML 样式（Step 1 警告修复）：
+//   QQuickStyle::setStyle("Fusion") 使 Qt Quick Controls 2 允许
+//   覆盖 background / contentItem 等属性。
 //
-// 失败路径（父进程校验、连接 launcher 失败）不写 .clean_exit：
-// 它们不是正常会话，下次启动时应被识别为异常退出并归档。
+// 主题系统（Step 3 / Step 4）：
+//   - loadGlobalParams() 启动时读系统模板 + 用户偏好，注入 QML
+//   - ThemeManager 提供运行时切换（写入 data/theme_preferences.json）
+//   - 切换需重启生效（不重载 QML）
 //
-// 阶段 1.7 C1：消息分发表接入（4 个 handler 迁移）
+// 窗口尺寸（Step 4.5）：
+//   - 启动时基于主屏幕分辨率计算：
+//       主窗口初始尺寸（基于比例 + 上下限）
+//       占位窗口尺寸（基于基准值 × 分辨率缩放）
+//   - QML 侧读 globalParams.layout.initial_window_* / placeholder_*
+//   - 用户可自由拉伸；最小尺寸由 min_window_* 约束
+//
+// 失败路径不写 .clean_exit：它们不是正常会话，下次启动应被归档。
 // ================================================================
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("gui");
+
+    Logger::instance().setLogDirectory(common::pathFromRoot("logs"));
 
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
 
@@ -451,10 +692,6 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
-    // 阶段 1.7 C1：注册消息 handler（必须在 Qt 事件循环启动前）
-    // 注：registerMessageHandlers 中的 lambda 不访问 Qt 对象，
-    //     仅访问全局 router 与函数指针（handleInitList 等）。
-    //     实际访问 Qt 对象发生在 pollPipe 触发时（Qt 主线程内），安全。
     registerMessageHandlers(g_message_router);
 
     std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
@@ -469,7 +706,6 @@ int main(int argc, char* argv[]) {
 
     std::string pipe_name_str = pipe_names::launcher_gui();
 
-    // C4 编码 helper（阶段 1.7）
     std::wstring pipe_name = common::utf8ToWide(pipe_name_str);
 
     LOG_INFO("Connecting to launcher pipe: " + pipe_name_str);
@@ -497,13 +733,17 @@ int main(int argc, char* argv[]) {
     QApplication::setApplicationName("Dream Machine");
     QApplication::setOrganizationName("DreamMachine");
     app.setStyle("Fusion");
-    LOG_INFO("QApplication initialized with Fusion style");
+    QQuickStyle::setStyle("Fusion");
+    LOG_INFO("QApplication initialized with Fusion style (Widgets + Quick Controls)");
 
     auto statusProvider = std::make_unique<StatusProvider>();
     g_statusProvider = statusProvider.get();
 
     auto sessionManager = std::make_unique<SessionStateManager>();
     g_sessionManager = sessionManager.get();
+
+    auto themeManager = std::make_unique<ThemeManager>();
+    g_themeManager = std::move(themeManager);
 
     auto engine = std::make_unique<QQmlApplicationEngine>();
     g_engine = engine.get();
@@ -512,6 +752,7 @@ int main(int argc, char* argv[]) {
     engine->rootContext()->setContextProperty("globalParams", globalParams);
     engine->rootContext()->setContextProperty("statusProvider", statusProvider.get());
     engine->rootContext()->setContextProperty("sessionManager", sessionManager.get());
+    engine->rootContext()->setContextProperty("themeManager", g_themeManager.get());
 
     QObject::connect(engine.get(), &QQmlApplicationEngine::warnings,
         [](const QList<QQmlError>& warnings) {
@@ -635,6 +876,7 @@ int main(int argc, char* argv[]) {
     g_engine.clear();
     g_pluginLoader.reset();
     g_statusProvider.clear();
+    g_themeManager.reset();
 
     LOG_INFO("=== GUI exited with code " + std::to_string(result) + " ===");
 
