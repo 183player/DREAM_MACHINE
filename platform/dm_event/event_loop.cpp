@@ -30,6 +30,15 @@ EventLoop::~EventLoop() {
 
 // ================================================================
 // 辅助：检查句柄是否可读
+//
+// 【C6 诚实标注】
+//   这是**轮询**检测——PeekNamedPipe 检查可读字节数，不阻塞、不消耗。
+//   registerReadable 通过反复调用本函数模拟"可读事件"。
+//   本函数不是事件驱动：没有句柄 signaled 通知机制。
+//
+// 返回语义：
+//   - true  : 有数据可读
+//   - false : 无数据可读，或句柄断开/无效
 // ================================================================
 
 bool EventLoop::isHandleReadable(HANDLE handle) {
@@ -244,6 +253,16 @@ void EventLoop::updateTimerEvents() {
 
 // ================================================================
 // 处理事件
+//
+// 【C6 诚实标注】
+//   本函数的实际行为按事件类型区分：
+//     - READABLE : 轮询检测（isHandleReadable），不进入 WaitForMultipleObjects
+//     - WAITABLE : 加入 wait_handles，进入 WaitForMultipleObjects
+//     - SIGNAL   : 加入 wait_handles，进入 WaitForMultipleObjects
+//     - TIMER    : 由 updateTimerEvents() 非阻塞处理
+//
+//   对外命名称 "event-driven main loop"，但 READABLE 与 TIMER 部分
+//   实际上是轮询语义。详见 event_loop.h 文件头说明。
 // ================================================================
 
 void EventLoop::processEvents(DWORD timeout_ms) {
@@ -259,32 +278,37 @@ void EventLoop::processEvents(DWORD timeout_ms) {
         }
 
         if (item->kind == EventItem::Kind::READABLE) {
-            // READABLE: 使用 Peek 直接检测，不进入等待循环
+            // READABLE: 轮询检测（C6 诚实标注）
+            //   本分支不进入 WaitForMultipleObjects，而是每次 processEvents
+            //   调用时用 PeekNamedPipe 检查是否有数据可读。
+            //   这是名实不符的根源——registerReadable 命名暗示事件驱动，
+            //   实际是轮询。
             if (isHandleReadable(item->handle)) {
                 if (item->callback) {
                     item->callback(EventType::READABLE, item->user_data);
                 }
             }
         } else if (item->kind == EventItem::Kind::WAITABLE) {
-            // WAITABLE: 将句柄加入等待列表
+            // WAITABLE: 将句柄加入等待列表（真正事件驱动）
             if (item->handle && item->handle != INVALID_HANDLE_VALUE) {
                 wait_handles.push_back(item->handle);
                 item_map.push_back(item.get());
             }
         } else if (item->kind == EventItem::Kind::SIGNAL) {
-            // SIGNAL: 使用 signal_event 等待
+            // SIGNAL: 使用 signal_event 等待（真正事件驱动）
             if (item->signal_event && item->signal_event != INVALID_HANDLE_VALUE) {
                 wait_handles.push_back(item->signal_event);
                 item_map.push_back(item.get());
             }
         }
-        // TIMER 由 updateTimerEvents 单独处理
+        // TIMER 由 updateTimerEvents 单独处理（非阻塞轮询）
     }
 
     // 更新定时器（不阻塞）
     updateTimerEvents();
 
     // ----- 如果没有需要等待的句柄，短暂休眠 -----
+    // 注：此处的 Sleep(10) 是轮询语义的一部分（当只有 READABLE/TIMER 时）
     if (wait_handles.size() <= 1) {
         Sleep(10);
         return;
@@ -346,6 +370,9 @@ void EventLoop::run() {
     }
 
     running_ = true;
+    // C6 诚实标注：日志保留 "EventLoop started"，但实际混合了
+    // 事件驱动（WAITABLE/SIGNAL）与轮询（READABLE/TIMER）两种语义。
+    // 详见 event_loop.h 文件头说明。
     LOG_INFO("EventLoop started");
 
     while (running_) {

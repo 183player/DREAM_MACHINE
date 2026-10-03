@@ -10,6 +10,9 @@
 #include <string>
 #include <vector>
 
+#include "logger.h"   // A.9：版本兼容性 WARN；A.10：request_id 读取
+#include <atomic>     // A.9：static atomic flag
+
 namespace dream_machine {
 
 // ================================================================
@@ -44,11 +47,17 @@ static bool parseSimplePayload(const std::string& json, QJsonObject& out_obj) {
 // buildMessage / parseBaseMessage
 // ================================================================
 
-// 构建消息：自动写入 version = msg_version::CURRENT
+// 构建消息 JSON
 //
-// 依据阶段 1.7 B4：
-//   - version 由本函数统一写入，调用方无需感知
-//   - 当前版本 = 1；未来升级需同步更新 messages.h 中的 msg_version::CURRENT
+// 自动写入：
+//   - version    = msg_version::CURRENT
+//   - request_id = Logger::getRequestId()（非空时；A.10 D2）
+//
+// A.10 D2 说明：
+//   - request_id 由 Logger thread_local 提供，各进程通过
+//     Logger::setRequestId / clearRequestId 控制
+//   - request_id 为空时 JSON 不写字段，向后兼容
+//   - 各 serializeXxx 内部调用本函数，因此零改动即自动携带
 std::string buildMessage(const std::string& type,
                          const std::string& cmd,
                          const std::string& payload_json) {
@@ -59,20 +68,31 @@ std::string buildMessage(const std::string& type,
     }
     obj["payload"] = toQString(payload_json);
     obj["version"] = msg_version::CURRENT;
+
+    // A.10 D2：自动携带当前线程的 request_id（非空时）
+    const std::string req = Logger::getRequestId();
+    if (!req.empty()) {
+        obj["request_id"] = toQString(req);
+    }
+
     QJsonDocument doc(obj);
     return doc.toJson(QJsonDocument::Compact).toStdString();
 }
 
-// 解析消息基字段（带版本）
+// 解析消息基字段（带版本 + request_id）
 //
-// 依据阶段 1.7 B4：
+// 依据阶段 1.7 B4 + A.9 最小协商 + A.10 D2：
 //   - version 字段缺失时给 CURRENT（兼容旧消息，不产生噪声）
-//   - 不做版本不匹配的 WARN（由调用方决定是否处理）
+//   - request_id 字段缺失时给空字符串（兼容旧消息）
+//   - 版本不兼容时仅记录 WARN（首次），不拒绝（保守策略）
+//   - 不做版本回退、不做降级
+//   - 不自动 setRequestId（由调用方决定）
 bool parseBaseMessage(const std::string& json,
                       std::string& out_type,
                       std::string& out_cmd,
                       std::string& out_payload,
-                      int& out_version) {
+                      int& out_version,
+                      std::string& out_request_id) {
     QJsonParseError error;
     QJsonDocument doc = QJsonDocument::fromJson(toQString(json).toUtf8(), &error);
     if (error.error != QJsonParseError::NoError) {
@@ -92,13 +112,58 @@ bool parseBaseMessage(const std::string& json,
     } else {
         out_version = msg_version::CURRENT;
     }
+
+    // A.10 D2：request_id（可选字段）
+    //   - 存在且为 string → 读取
+    //   - 缺失或类型不符 → 空字符串
+    //   - 不自动 setRequestId（由调用方决定）
+    if (obj.contains("request_id") && obj["request_id"].isString()) {
+        out_request_id = toStdString(obj["request_id"].toString());
+    } else {
+        out_request_id.clear();
+    }
+
+    // ----- A.9：版本兼容性检查（最小协商） -----
+    //
+    // 语义：
+    //   - 对端 version 在 [MIN_SUPPORTED, CURRENT] 范围内 → 兼容，正常处理
+    //   - 其他情况 → 不兼容
+    //
+    // 不兼容处理（保守策略）：
+    //   - 仅记录一次 WARN（static atomic flag 防止刷屏）
+    //   - 仍继续处理消息（不拒绝、不回退、不降级）
+    if (!msg_version::isCompatible(out_version)) {
+        static std::atomic<bool> version_warned{false};
+        if (!version_warned.exchange(true)) {
+            LOG_WARN("Message version incompatible: remote=" +
+                     std::to_string(out_version) +
+                     ", supported=[" +
+                     std::to_string(msg_version::MIN_SUPPORTED) + ", " +
+                     std::to_string(msg_version::CURRENT) + "]" +
+                     " — continuing anyway (conservative)");
+        }
+    }
+
     return true;
 }
 
-// 解析消息基字段（兼容签名，忽略 version）
+// 解析消息基字段（带版本，忽略 request_id）
+//
+// 委托给带 request_id 的重载，忽略 request_id 输出。
+bool parseBaseMessage(const std::string& json,
+                      std::string& out_type,
+                      std::string& out_cmd,
+                      std::string& out_payload,
+                      int& out_version) {
+    std::string ignored_request_id;
+    return parseBaseMessage(json, out_type, out_cmd, out_payload,
+                            out_version, ignored_request_id);
+}
+
+// 解析消息基字段（兼容签名：忽略 version 与 request_id）
 //
 // 保留此签名以保证现有调用点零改动；
-// 内部委托给带 version 的重载。
+// 内部委托给带 version 的重载（该重载会做版本兼容性检查）。
 bool parseBaseMessage(const std::string& json,
                       std::string& out_type,
                       std::string& out_cmd,

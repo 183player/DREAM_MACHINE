@@ -12,6 +12,7 @@ add_library(dm_base STATIC
         message_router.h
         init_list_utils.h
         init_list_utils.cpp
+        error_notify_bridge.h
 )
 
 # 公开头文件路径（供其他模块使用）

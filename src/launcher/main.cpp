@@ -7,8 +7,15 @@
 #include "messages.h"
 #include "message_router.h"
 #include "error_codes.h"
+#include "error_notify_bridge.h"   // A.11.2a：ErrorContext → ErrorNotifyMessage 映射
 #include "event_loop.h"
 #include "common_utils.h"
+
+// dm_signal（A.8 装配）
+#include "signal_bus.h"
+#include "message_bridge.h"
+#include "signal_types.h"
+#include "signal_strings.h"
 
 #include <iostream>
 #include <string>
@@ -24,8 +31,6 @@
 using namespace dream_machine;
 using namespace dream_machine::launcher;
 using namespace dream_machine::event;
-// 注：不再 using dream_machine::common——
-//     新增的 utf8ToWide / wideToUtf8 / pathFromRoot 用 common:: 前缀显式调用。
 
 // ================================================================
 // 前向声明
@@ -33,12 +38,13 @@ using namespace dream_machine::event;
 namespace {
     void handleFullSyncResponse(const std::string& payload);
     void handleSessionStateChange(const std::string& payload, NamedPipe& gui_pipe);
-    void handleActiveSessionsResp(const std::string& message, NamedPipe& gui_pipe);
     void onProcessExit(EventType type, void* user_data);
     void onPipeReadable(EventType type, void* user_data);
     void onHeartbeat(EventType type, void* user_data);
     void requestGracefulShutdown(const std::string& reason);
     void registerMessageHandlers(MessageRouter& router);
+    void attachSignalBus();
+    void detachSignalBus();
 }
 
 // ================================================================
@@ -59,59 +65,192 @@ struct SessionState {
     uint64_t last_update = 0;
 };
 
-// 全局状态
-std::unordered_map<std::string, SessionState> sessions_;
-std::mutex sessions_mutex_;
-std::unique_ptr<PluginManager> g_plugin_manager;
-std::atomic<bool> g_shutdown_requested{false};
+// ================================================================
+// LauncherState：launcher 全局状态收敛载体（A.3.1 C3）
+// ================================================================
+struct LauncherState {
+    // ---- 通信资源 ----
+    NamedPipe* monitor_pipe = nullptr;
+    NamedPipe* executor_pipe = nullptr;
+    NamedPipe* gui_pipe = nullptr;
 
-// 子进程管理（shared_ptr 管理生命周期，为未来业务内聚线程预留）
-std::vector<std::shared_ptr<Process>> g_managed_processes;
-NamedPipe* g_monitor_pipe = nullptr;
-NamedPipe* g_executor_pipe = nullptr;
-NamedPipe* g_gui_pipe = nullptr;
+    // ---- 进程资源 ----
+    std::vector<std::shared_ptr<Process>> managed_processes;
 
-// 事件循环指针（用于回调中停止）
-EventLoop* g_event_loop = nullptr;
+    // ---- 会话状态 ----
+    std::unordered_map<std::string, SessionState> sessions;
+    std::mutex sessions_mutex;
 
-// 优雅关闭定时器（500ms 自愿窗口）
-std::atomic<bool> g_grace_timer_started{false};
-EventHandle g_grace_timer_handle{0, false};
+    // ---- 生命周期 ----
+    std::atomic<bool> shutdown_requested{false};
+    std::atomic<bool> grace_timer_started{false};
+    EventHandle grace_timer_handle{0, false};
+    EventLoop* event_loop = nullptr;
 
-// 诊断：Job 句柄信息仅记录一次
-bool g_job_info_logged = false;
+    // ---- 插件 ----
+    std::unique_ptr<PluginManager> plugin_manager;
 
-// 消息分发表
-//
-// 迁移了 5 个 handler（PLUGIN_IMPORT / PLUGIN_DELETE / PLUGIN_ENABLE /
-// FULL_SYNC_RESPONSE / SESSION_STATE_CHANGED）。
-// ACTIVE_SESSIONS_RESP 未迁移——它需要完整 message 字符串（转发给 gui），
-// handler 签名只接收 payload，故保留在原 if-else fallback 中。
-//
-// 回退方式：删除本变量 + registerMessageHandlers 调用，
-//          并将 onPipeReadable 恢复为原始 if-else 即可。
-MessageRouter g_message_router;
+    // ---- 消息分发表 ----
+    MessageRouter message_router;
 
-// 用于在回调中访问的上下文
-// 注：当前未被实际使用（保留为未来状态收敛的载体）
-struct LauncherContext {
-    NamedPipe* monitor_pipe;
-    NamedPipe* executor_pipe;
-    NamedPipe* gui_pipe;
-    std::vector<std::shared_ptr<Process>>* processes;
-    std::atomic<bool>* shutdown;
+    // ---- 诊断 ----
+    bool job_info_logged = false;
+
+    // ---- 心跳 ----
+    int heartbeat_counter = 0;
 };
-std::unique_ptr<LauncherContext> g_context;
+
+static LauncherState g_state;
+
+// ================================================================
+// publish_error：通过 SignalBus 发布结构化错误（A.11.2a B3 接线）
+//
+// 单一映射路径（D5 §8.2 / D3 DREAM-010）：
+//   ErrorContext 语义 → SignalPayload → SignalBus
+//     ├→ Logger（进程内日志，[signal:error_notify] 前缀）
+//     └→ MessageBridge → Sender 重建 ErrorNotifyMessage → 跨进程
+//
+// 说明：
+//   - severity 走 error_severity_to_signal_level_int（受控映射，D3 DREAM-010）
+//   - error_code 走 errorCodeToString（受控字符串）
+//   - extra["error_code"] 携带错误码，供 Sender 重建 details
+//   - 不直接 writeLine：让 Logger / MessageBridge 各自消费
+//
+// 参数：
+//   code       - 错误码（ErrorCode）
+//   severity   - 严重级别（ErrorSeverity）
+//   message    - 人类可读消息
+//   details    - 补充详情（可选）
+//   session_id - 会话 ID（可选）
+// ================================================================
+void publish_error(ErrorCode code,
+                   ErrorSeverity severity,
+                   const std::string& message,
+                   const std::string& details = "",
+                   const std::string& session_id = "") {
+    signal::SignalPayload payload;
+    payload.type = signal::SignalType::SGT_ERROR_NOTIFY;
+    payload.level = static_cast<signal::SignalLevel>(
+        error_severity_to_signal_level_int(severity));
+    payload.timestamp_ms = signal::now_ms();
+    payload.description = message;
+    payload.detail = details;
+    if (!session_id.empty()) {
+        payload.session_id = session_id;
+    }
+    // 携带错误码（Sender 重建 details 时使用）
+    payload.extra["error_code"] = errorCodeToString(code);
+
+    signal::SignalBus::instance().publish(payload);
+}
+
+// ================================================================
+// dm_signal 装配（A.8 装配 + A.11.2a Sender 完整实现）
+//
+// 订阅顺序：Logger → MessageBridge
+// 依据：详见文档13 §3.3
+//
+// Sender 完整实现（A.11.2a）：
+//   - 从 SignalPayload 重建 ErrorNotifyMessage
+//   - severity 用 signal_level_to_string（受控字符串）
+//   - message 用 payload.description
+//   - details 用 payload.detail + extra["error_code"]
+//   - 序列化 + writeLine
+// ================================================================
+void attachSignalBus() {
+    Logger::attach_to_signal_bus();
+    signal::SignalBus::instance().subscribe(&signal::MessageBridge::instance());
+
+    // launcher → gui（错误通知）
+    (void)signal::MessageBridge::instance().add_sender(
+        "gui",
+        [](const signal::SignalPayload& payload) -> bool {
+            if (!g_state.gui_pipe || !g_state.gui_pipe->isValid()) {
+                return false;
+            }
+
+            // A.11.2a：从 SignalPayload 重建 ErrorNotifyMessage
+            ErrorNotifyMessage notify;
+            notify.source = "launcher";
+            notify.severity = signal::signal_level_to_string(payload.level);
+            notify.message = payload.description;
+
+            // details：优先 payload.detail，追加 extra["error_code"]
+            std::string details = payload.detail;
+            auto it_code = payload.extra.find("error_code");
+            if (it_code != payload.extra.end() && !it_code->second.empty()) {
+                if (!details.empty()) {
+                    details += " | ";
+                }
+                details += std::string("code=") + it_code->second;
+            }
+            if (!details.empty()) {
+                notify.details = details;
+            }
+
+            std::string json = serializeErrorNotify(notify);
+            PipeResult result = g_state.gui_pipe->writeLine(json);
+            if (result == PipeResult::PIPE_OK) {
+                LOG_INFO("ErrorNotify sent to gui: " + payload.description);
+                return true;
+            }
+            LOG_WARN("Failed to send ErrorNotify to gui");
+            return false;
+        },
+        [](const signal::SignalPayload& payload) -> bool {
+            return payload.type == signal::SignalType::SGT_ERROR_NOTIFY;
+        });
+
+    // launcher → monitor（错误通知）
+    (void)signal::MessageBridge::instance().add_sender(
+        "monitor",
+        [](const signal::SignalPayload& payload) -> bool {
+            if (!g_state.monitor_pipe || !g_state.monitor_pipe->isValid()) {
+                return false;
+            }
+
+            // A.11.2a：从 SignalPayload 重建 ErrorNotifyMessage
+            ErrorNotifyMessage notify;
+            notify.source = "launcher";
+            notify.severity = signal::signal_level_to_string(payload.level);
+            notify.message = payload.description;
+
+            std::string details = payload.detail;
+            auto it_code = payload.extra.find("error_code");
+            if (it_code != payload.extra.end() && !it_code->second.empty()) {
+                if (!details.empty()) {
+                    details += " | ";
+                }
+                details += std::string("code=") + it_code->second;
+            }
+            if (!details.empty()) {
+                notify.details = details;
+            }
+
+            std::string json = serializeErrorNotify(notify);
+            PipeResult result = g_state.monitor_pipe->writeLine(json);
+            if (result == PipeResult::PIPE_OK) {
+                LOG_INFO("ErrorNotify sent to monitor: " + payload.description);
+                return true;
+            }
+            LOG_WARN("Failed to send ErrorNotify to monitor");
+            return false;
+        },
+        [](const signal::SignalPayload& payload) -> bool {
+            return payload.type == signal::SignalType::SGT_ERROR_NOTIFY;
+        });
+
+    LOG_INFO("dm_signal attached: Logger + MessageBridge (launcher)");
+}
+
+void detachSignalBus() {
+    signal::MessageBridge::instance().remove_all_senders();
+    Logger::detach_from_signal_bus();
+    LOG_INFO("dm_signal detached (launcher)");
+}
 
 // ================================================================
 // 诊断辅助：查询 Job Object 内当前进程数
-//
-// 用于 cleanup() 关闭 Job 前确认残留情况。
-// 失败时返回 -1（不影响主流程）。
-//
-// 错误码说明：
-//   QueryInformationJobObject 在 buffer=NULL 时返回
-//   ERROR_BAD_LENGTH(24)，而非 ERROR_MORE_DATA(234)。
 // ================================================================
 int queryJobProcessCount(HANDLE job_handle) {
     if (!job_handle || job_handle == INVALID_HANDLE_VALUE) {
@@ -122,8 +261,6 @@ int queryJobProcessCount(HANDLE job_handle) {
     if (!QueryInformationJobObject(job_handle, JobObjectBasicProcessIdList,
                                     nullptr, 0, &bytes_needed)) {
         DWORD err = GetLastError();
-        // ERROR_BAD_LENGTH：buffer 为 NULL 时的正常返回值（需更多空间）
-        // ERROR_MORE_DATA：buffer 不足时的返回值（旧 Windows）
         if (err != ERROR_BAD_LENGTH && err != ERROR_MORE_DATA) {
             LOG_WARN("QueryInformationJobObject size query failed: " +
                      std::to_string(err));
@@ -152,10 +289,10 @@ int queryJobProcessCount(HANDLE job_handle) {
 // 诊断辅助：Job 句柄继承性检查（仅记录一次）
 // ================================================================
 void logJobHandleInfoOnce(HANDLE job_handle) {
-    if (g_job_info_logged) {
+    if (g_state.job_info_logged) {
         return;
     }
-    g_job_info_logged = true;
+    g_state.job_info_logged = true;
 
     if (!job_handle || job_handle == INVALID_HANDLE_VALUE) {
         LOG_WARN("Job handle is invalid, cannot check inheritable flag");
@@ -240,13 +377,9 @@ void cleanup(const std::vector<std::shared_ptr<Process>>& managed_processes, HAN
 
 // ================================================================
 // 优雅关闭流程
-//
-// 未来重审点：最后一个退出进程的 WAITABLE 回调可能未触发
-//             （日志少一条）。修复方案：EventLoop 新增 drainPendingEvents()，
-//             stop 前处理完所有已 signaled 的 WAITABLE 事件。
 // ================================================================
 void requestGracefulShutdown(const std::string& reason) {
-    if (g_shutdown_requested.exchange(true)) {
+    if (g_state.shutdown_requested.exchange(true)) {
         return;
     }
 
@@ -279,27 +412,27 @@ void requestGracefulShutdown(const std::string& reason) {
         }
     };
 
-    broadcast(g_monitor_pipe, "monitor");
-    broadcast(g_executor_pipe, "executor");
-    broadcast(g_gui_pipe, "gui");
+    broadcast(g_state.monitor_pipe, "monitor");
+    broadcast(g_state.executor_pipe, "executor");
+    broadcast(g_state.gui_pipe, "gui");
 
-    if (!g_grace_timer_started.exchange(true)) {
-        if (g_event_loop) {
-            g_grace_timer_handle = g_event_loop->registerTimer(
+    if (!g_state.grace_timer_started.exchange(true)) {
+        if (g_state.event_loop) {
+            g_state.grace_timer_handle = g_state.event_loop->registerTimer(
                 constants::SHUTDOWN_GRACE_MS,
                 [](EventType, void*) {
                     LOG_INFO("Grace period expired, forcing shutdown");
-                    if (g_event_loop) {
-                        g_event_loop->stop();
+                    if (g_state.event_loop) {
+                        g_state.event_loop->stop();
                     }
                 },
                 nullptr,
                 true
             );
-            if (!g_grace_timer_handle.active) {
+            if (!g_state.grace_timer_handle.active) {
                 LOG_WARN("Failed to register grace timer, falling back to immediate stop");
-                if (g_event_loop) {
-                    g_event_loop->stop();
+                if (g_state.event_loop) {
+                    g_state.event_loop->stop();
                 }
             } else {
                 LOG_INFO("Grace timer started (" +
@@ -318,13 +451,18 @@ void handleSessionStateChange(const std::string& payload, NamedPipe& gui_pipe) {
     auto msg = parseSessionStateChanged(payload);
     if (!msg.has_value()) {
         LOG_WARN("Failed to parse SESSION_STATE_CHANGED message");
+        // A.11.2a：结构化错误信号
+        publish_error(ErrorCode::JSON_ERROR,
+                      ErrorSeverity::WARNING,
+                      "Failed to parse SESSION_STATE_CHANGED",
+                      "parseSessionStateChanged returned nullopt");
         return;
     }
 
     {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        auto it = sessions_.find(msg->session_id);
-        if (it == sessions_.end()) {
+        std::lock_guard<std::mutex> lock(g_state.sessions_mutex);
+        auto it = g_state.sessions.find(msg->session_id);
+        if (it == g_state.sessions.end()) {
             SessionState new_state;
             new_state.session_id = msg->session_id;
             new_state.state = msg->state;
@@ -332,7 +470,7 @@ void handleSessionStateChange(const std::string& payload, NamedPipe& gui_pipe) {
             new_state.last_update = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()
             ).count();
-            sessions_[msg->session_id] = new_state;
+            g_state.sessions[msg->session_id] = new_state;
         } else {
             it->second.state = msg->state;
             if (msg->pipe_name.has_value()) {
@@ -356,17 +494,15 @@ void handleSessionStateChange(const std::string& payload, NamedPipe& gui_pipe) {
     }
 }
 
-void handleActiveSessionsResp(const std::string& message, NamedPipe& gui_pipe) {
-    if (gui_pipe.isValid() && gui_pipe.isConnected()) {
-        gui_pipe.writeLine(message);
-        LOG_INFO("Forwarded ACTIVE_SESSIONS_RESP to gui");
-    }
-}
-
 void handleFullSyncResponse(const std::string& payload) {
     auto resp = parseFullSyncResponse(payload);
     if (!resp.has_value()) {
         LOG_WARN("Failed to parse FULL_SYNC_RESPONSE");
+        // A.11.2a：结构化错误信号
+        publish_error(ErrorCode::JSON_ERROR,
+                      ErrorSeverity::WARNING,
+                      "Failed to parse FULL_SYNC_RESPONSE",
+                      "parseFullSyncResponse returned nullopt");
         return;
     }
 
@@ -374,8 +510,8 @@ void handleFullSyncResponse(const std::string& payload) {
              ", sessions: " + std::to_string(resp->sessions.size()) + ")");
 
     {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        sessions_.clear();
+        std::lock_guard<std::mutex> lock(g_state.sessions_mutex);
+        g_state.sessions.clear();
         for (const auto& s : resp->sessions) {
             SessionState state;
             state.session_id = s.session_id;
@@ -384,7 +520,7 @@ void handleFullSyncResponse(const std::string& payload) {
             state.last_update = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()
             ).count();
-            sessions_[s.session_id] = state;
+            g_state.sessions[s.session_id] = state;
             LOG_INFO("Sync: session " + s.session_id + " -> " + s.state);
         }
     }
@@ -404,7 +540,7 @@ void registerMessageHandlers(MessageRouter& router) {
             if (!import_msg.has_value()) return;
 
             std::string plugin_id;
-            bool success = g_plugin_manager->importPlugin(import_msg->package_path, plugin_id);
+            bool success = g_state.plugin_manager->importPlugin(import_msg->package_path, plugin_id);
             PluginImportRespMessage resp;
             resp.success = success;
             if (success) {
@@ -426,7 +562,7 @@ void registerMessageHandlers(MessageRouter& router) {
             auto delete_msg = parsePluginDelete(payload);
             if (!delete_msg.has_value()) return;
 
-            bool success = g_plugin_manager->deletePlugin(delete_msg->plugin_id);
+            bool success = g_state.plugin_manager->deletePlugin(delete_msg->plugin_id);
             PluginDeleteRespMessage resp;
             resp.success = success;
             if (!success) {
@@ -445,8 +581,8 @@ void registerMessageHandlers(MessageRouter& router) {
             auto enable_msg = parsePluginEnable(payload);
             if (!enable_msg.has_value()) return;
 
-            bool success = g_plugin_manager->setPluginEnabled(enable_msg->plugin_id,
-                                                             enable_msg->enabled);
+            bool success = g_state.plugin_manager->setPluginEnabled(enable_msg->plugin_id,
+                                                                    enable_msg->enabled);
             PluginEnableRespMessage resp;
             resp.success = success;
             if (!success) {
@@ -466,11 +602,11 @@ void registerMessageHandlers(MessageRouter& router) {
     router.register_handler(msg_types::SESSION_STATE_CHANGED,
         [](const std::string& payload, void* ctx) {
             auto* pipe = static_cast<NamedPipe*>(ctx);
-            if (pipe == g_gui_pipe) {
+            if (pipe == g_state.gui_pipe) {
                 LOG_WARN("SESSION_STATE_CHANGED should come from monitor, not gui");
             } else {
-                if (g_gui_pipe) {
-                    handleSessionStateChange(payload, *g_gui_pipe);
+                if (g_state.gui_pipe) {
+                    handleSessionStateChange(payload, *g_state.gui_pipe);
                 }
             }
         });
@@ -492,7 +628,7 @@ void onProcessExit(EventType type, void* user_data) {
     {
         std::string snapshot = "Process snapshot:";
         bool all_exited = true;
-        for (const auto& p : g_managed_processes) {
+        for (const auto& p : g_state.managed_processes) {
             if (!p) {
                 continue;
             }
@@ -510,20 +646,32 @@ void onProcessExit(EventType type, void* user_data) {
 
         if (all_exited) {
             LOG_INFO("All subprocesses exited, stopping event loop immediately");
-            if (g_event_loop) {
-                g_event_loop->stop();
+            if (g_state.event_loop) {
+                g_state.event_loop->stop();
             }
         }
     }
 }
 
+// ================================================================
+// onPipeReadable
+//
+// A.4  C1：移除 ACTIVE_SESSIONS_RESP fallback，统一走 router。
+// A.11.2a B3：pipe broken 时发布结构化错误信号。
+// ================================================================
 void onPipeReadable(EventType type, void* user_data) {
     (void)type;
-    if (!user_data || g_shutdown_requested) return;
+    if (!user_data || g_state.shutdown_requested) return;
 
     NamedPipe* pipe = static_cast<NamedPipe*>(user_data);
+
+    // A.11.2a：管道无效/断开时结构化错误（替代静默 WARN）
     if (!pipe->isValid() || pipe->isBroken()) {
         LOG_WARN("Pipe invalid or broken");
+        publish_error(ErrorCode::PIPE_BROKEN,
+                      ErrorSeverity::RECOVERABLE,
+                      "Launcher pipe invalid or broken",
+                      "isBroken() returned true");
         requestGracefulShutdown(shutdown_reason::PEER_EXIT);
         return;
     }
@@ -541,39 +689,35 @@ void onPipeReadable(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            // ---- 优先走分发表 ----
-            if (g_message_router.dispatch(type_str, payload, pipe)) {
-                return;
-            }
-
-            // ---- fallback：未迁移的消息类型 ----
-            // 当前仅 ACTIVE_SESSIONS_RESP（需完整 message 转发给 gui）
-            if (type_str == msg_types::ACTIVE_SESSIONS_RESP) {
-                if (g_gui_pipe) {
-                    handleActiveSessionsResp(message, *g_gui_pipe);
-                }
-            } else {
+            if (!g_state.message_router.dispatch(type_str, payload, pipe)) {
                 LOG_WARN("Unhandled message type: " + type_str);
             }
         } else {
             LOG_WARN("Failed to parse base message");
+            publish_error(ErrorCode::JSON_ERROR,
+                          ErrorSeverity::WARNING,
+                          "Failed to parse base message",
+                          "parseBaseMessage returned false");
         }
     } else if (read_result == PipeResult::PIPE_BROKEN) {
         LOG_WARN("Pipe broken during read");
+        publish_error(ErrorCode::PIPE_BROKEN,
+                      ErrorSeverity::RECOVERABLE,
+                      "Launcher pipe broken during read",
+                      "readLineBuffered returned PIPE_BROKEN");
         requestGracefulShutdown(shutdown_reason::PEER_EXIT);
     }
 }
 
-int g_heartbeat_counter = 0;
 void onHeartbeat(EventType type, void* user_data) {
     (void)type;
     (void)user_data;
 
-    ++g_heartbeat_counter;
-    if (g_heartbeat_counter % 100 == 0) {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        LOG_INFO("Launcher heartbeat: " + std::to_string(g_heartbeat_counter) +
-                 " iterations, sessions: " + std::to_string(sessions_.size()));
+    ++g_state.heartbeat_counter;
+    if (g_state.heartbeat_counter % 100 == 0) {
+        std::lock_guard<std::mutex> lock(g_state.sessions_mutex);
+        LOG_INFO("Launcher heartbeat: " + std::to_string(g_state.heartbeat_counter) +
+                 " iterations, sessions: " + std::to_string(g_state.sessions.size()));
     }
 }
 
@@ -634,16 +778,11 @@ int showPluginInfo() {
 // ================================================================
 // main 入口
 //
-// 路径策略（Step 0 路径修正）：
-//   所有运行时资源（logs/ / plugins/ / data/）基于可执行文件所在目录，
-//   不依赖当前工作目录（CWD）。保证 bin/ 整体挪走后仍正常运行。
-//
-// 日志生命周期：
-//   - 启动：setProcessName → setLogDirectory → archiveLastSessionIfDirty → 开始日志
-//   - 退出：最后一条日志 → markCleanExit → return 0
-//
-// --show-plugin-info 分支与启动失败路径不写 .clean_exit 标记：
-// 它们不是正常会话，不应影响下次启动的归档判断。
+// 本分片合并改动：
+//   A.3.1    C3 全局状态收敛（LauncherState g_state）
+//   A.4      C1 分发表下沉（移除 ACTIVE_SESSIONS_RESP fallback）
+//   A.8      dm_signal 装配（Logger attach + MessageBridge subscribe + sender）
+//   A.11.2a  B3 错误结构化接线（Sender 完整实现 + isBroken 结构化错误）
 // ================================================================
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--show-plugin-info") {
@@ -652,7 +791,6 @@ int main(int argc, char* argv[]) {
 
     Logger::instance().setProcessName("launcher");
 
-    // 路径修正：日志目录基于 exe 目录，不依赖 CWD
     Logger::instance().setLogDirectory(common::pathFromRoot("logs"));
 
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
@@ -663,23 +801,39 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
-    registerMessageHandlers(g_message_router);
+    // A.8：dm_signal 装配（Logger + MessageBridge）
+    attachSignalBus();
 
-    g_plugin_manager = std::make_unique<PluginManager>();
+    registerMessageHandlers(g_state.message_router);
 
-    if (!g_plugin_manager->verifySystemPlugins()) {
+    g_state.plugin_manager = std::make_unique<PluginManager>();
+
+    if (!g_state.plugin_manager->verifySystemPlugins()) {
         LOG_WARN("System plugin integrity check failed, continuing anyway");
+        // A.11.2a：结构化错误信号
+        publish_error(ErrorCode::PLUGIN_VERIFY_FAILED,
+                      ErrorSeverity::WARNING,
+                      "System plugin integrity check failed",
+                      "verifySystemPlugins returned false; continuing");
     }
 
-    if (!g_plugin_manager->scanPlugins()) {
+    if (!g_state.plugin_manager->scanPlugins()) {
         LOG_WARN("Plugin scan failed, continuing without plugins");
+        publish_error(ErrorCode::PLUGIN_LOAD_FAILED,
+                      ErrorSeverity::WARNING,
+                      "Plugin scan failed",
+                      "scanPlugins returned false; continuing without plugins");
     }
 
-    plugin::InitList init_list = g_plugin_manager->generateInitList();
+    plugin::InitList init_list = g_state.plugin_manager->generateInitList();
 
     HANDLE job_handle = CreateJobObjectW(nullptr, L"Global\\DreamMachine_Launcher_Job");
     if (!job_handle) {
         LOG_ERROR("Failed to create Job Object: error " + std::to_string(GetLastError()));
+        publish_error(ErrorCode::PROCESS_LAUNCH_FAILED,
+                      ErrorSeverity::FATAL,
+                      "Failed to create Job Object",
+                      "CreateJobObjectW returned null");
     } else {
         LOG_INFO("Job Object created successfully");
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_info = {};
@@ -689,6 +843,10 @@ int main(int argc, char* argv[]) {
         if (!SetInformationJobObject(job_handle, JobObjectExtendedLimitInformation,
                                      &job_info, sizeof(job_info))) {
             LOG_ERROR("Failed to configure Job Object: error " + std::to_string(GetLastError()));
+            publish_error(ErrorCode::PROCESS_LAUNCH_FAILED,
+                          ErrorSeverity::FATAL,
+                          "Failed to configure Job Object",
+                          "SetInformationJobObject failed");
         } else {
             LOG_INFO("Job Object configured: KILL_ON_JOB_CLOSE + SILENT_BREAKAWAY_OK enabled");
         }
@@ -715,19 +873,34 @@ int main(int argc, char* argv[]) {
 
     if (!monitor_pipe.createServer(monitor_pipe_name, MAX_INSTANCES, true)) {
         LOG_ERROR("Failed to create monitor pipe server");
-        cleanup(g_managed_processes, job_handle);
+        publish_error(ErrorCode::PIPE_CREATE_FAILED,
+                      ErrorSeverity::FATAL,
+                      "Failed to create monitor pipe server",
+                      monitor_pipe_name_str);
+        cleanup(g_state.managed_processes, job_handle);
+        detachSignalBus();
         return 1;
     }
 
     if (!executor_pipe.createServer(executor_pipe_name, MAX_INSTANCES, true)) {
         LOG_ERROR("Failed to create executor pipe server");
-        cleanup(g_managed_processes, job_handle);
+        publish_error(ErrorCode::PIPE_CREATE_FAILED,
+                      ErrorSeverity::FATAL,
+                      "Failed to create executor pipe server",
+                      executor_pipe_name_str);
+        cleanup(g_state.managed_processes, job_handle);
+        detachSignalBus();
         return 1;
     }
 
     if (!gui_pipe.createServer(gui_pipe_name, MAX_INSTANCES, true)) {
         LOG_ERROR("Failed to create gui pipe server");
-        cleanup(g_managed_processes, job_handle);
+        publish_error(ErrorCode::PIPE_CREATE_FAILED,
+                      ErrorSeverity::FATAL,
+                      "Failed to create gui pipe server",
+                      gui_pipe_name_str);
+        cleanup(g_state.managed_processes, job_handle);
+        detachSignalBus();
         return 1;
     }
 
@@ -740,14 +913,22 @@ int main(int argc, char* argv[]) {
 
     DWORD parent_pid = GetCurrentProcessId();
     for (const auto& info : subprocesses) {
-        if (!launchSubprocess(info, g_managed_processes, job_handle, parent_pid)) {
+        if (!launchSubprocess(info, g_state.managed_processes, job_handle, parent_pid)) {
             LOG_ERROR("Failed to launch " + common::wideToUtf8(info.name));
+            publish_error(ErrorCode::PROCESS_LAUNCH_FAILED,
+                          ErrorSeverity::FATAL,
+                          "Failed to launch subprocess",
+                          common::wideToUtf8(info.name));
         }
     }
 
-    if (g_managed_processes.size() != 3) {
-        LOG_WARN("Only " + std::to_string(g_managed_processes.size()) +
+    if (g_state.managed_processes.size() != 3) {
+        LOG_WARN("Only " + std::to_string(g_state.managed_processes.size()) +
                  "/3 subprocesses started successfully");
+        publish_error(ErrorCode::PROCESS_LAUNCH_FAILED,
+                      ErrorSeverity::WARNING,
+                      "Not all subprocesses started",
+                      std::to_string(g_state.managed_processes.size()) + "/3");
     }
 
     LOG_INFO("Waiting for subprocesses to connect...");
@@ -777,16 +958,25 @@ int main(int argc, char* argv[]) {
 
     if (connected_count < 3) {
         LOG_WARN("Only " + std::to_string(connected_count) + "/3 subprocesses connected");
+        publish_error(ErrorCode::PIPE_CONNECT_FAILED,
+                      ErrorSeverity::WARNING,
+                      "Not all subprocesses connected",
+                      std::to_string(connected_count) + "/3");
     } else {
         LOG_INFO("All subprocesses connected successfully");
     }
 
     if (connected_count == 3) {
-        bool dist_ok = g_plugin_manager->distributeInitList(gui_pipe, executor_pipe, monitor_pipe, init_list);
+        bool dist_ok = g_state.plugin_manager->distributeInitList(
+            gui_pipe, executor_pipe, monitor_pipe, init_list);
         if (dist_ok) {
             LOG_INFO("INIT_LIST distributed to all processes");
         } else {
             LOG_WARN("INIT_LIST distribution incomplete");
+            publish_error(ErrorCode::PLUGIN_LOAD_FAILED,
+                          ErrorSeverity::WARNING,
+                          "INIT_LIST distribution incomplete",
+                          "distributeInitList returned false");
         }
 
         InitSessionListMessage init_session_msg;
@@ -799,14 +989,14 @@ int main(int argc, char* argv[]) {
         LOG_WARN("Not all processes connected, skipping INIT_LIST distribution");
     }
 
-    g_monitor_pipe = &monitor_pipe;
-    g_executor_pipe = &executor_pipe;
-    g_gui_pipe = &gui_pipe;
+    g_state.monitor_pipe = &monitor_pipe;
+    g_state.executor_pipe = &executor_pipe;
+    g_state.gui_pipe = &gui_pipe;
 
     EventLoop event_loop;
-    g_event_loop = &event_loop;
+    g_state.event_loop = &event_loop;
 
-    for (auto& proc : g_managed_processes) {
+    for (auto& proc : g_state.managed_processes) {
         EventHandle handle = event_loop.registerWaitable(proc->getHandle(), onProcessExit, proc.get());
         if (!handle.active) {
             LOG_ERROR("Failed to register waitable for process PID: " + std::to_string(proc->getPid()));
@@ -866,10 +1056,13 @@ int main(int argc, char* argv[]) {
     executor_pipe.close();
     gui_pipe.close();
 
-    cleanup(g_managed_processes, job_handle);
+    cleanup(g_state.managed_processes, job_handle);
 
-    g_plugin_manager.reset();
-    g_event_loop = nullptr;
+    // A.8：dm_signal 卸载（与 attachSignalBus 配对）
+    detachSignalBus();
+
+    g_state.plugin_manager.reset();
+    g_state.event_loop = nullptr;
 
     LOG_INFO("=== Launcher exited ===");
 

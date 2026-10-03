@@ -24,7 +24,7 @@
 namespace dream_machine {
 
 // ================================================================
-// 匿名命名空间：常量、thread_local channel、辅助函数、信号 Adapter
+// 匿名命名空间：常量、thread_local channel / request_id、辅助函数、信号 Adapter
 // ================================================================
 namespace {
 
@@ -37,6 +37,11 @@ constexpr const char* CRASH_DIR_NAME = "crashes";
 // channel 使用 thread_local 语义：每个线程独立的当前 channel。
 // 主线程默认为空字符串；通过 setChannel() / LogChannelScope 切换。
 thread_local std::string t_current_channel;
+
+// A.10 D2：request_id 使用 thread_local 语义。
+// 默认为空；非空时日志格式输出 [req:xxx] 前缀。
+// 由上层 setRequestId / clearRequestId / RequestIdScope 控制。
+thread_local std::string t_request_id;
 
 // 生成用于文件名的紧凑时间戳：YYYYMMDD_HHMMSS_mmm
 std::string makeTimestampForFilename() {
@@ -229,6 +234,24 @@ void Logger::setMaxBackupFiles(int count) {
 }
 
 // ================================================================
+// 请求关联 ID（A.10 D2）
+//
+// thread_local 静态存储；无共享状态，无需加锁。
+// ================================================================
+
+void Logger::setRequestId(const std::string& request_id) {
+    t_request_id = request_id;
+}
+
+void Logger::clearRequestId() {
+    t_request_id.clear();
+}
+
+std::string Logger::getRequestId() {
+    return t_request_id;
+}
+
+// ================================================================
 // 信号总线装配（方案 D）
 //
 // attach / detach 幂等：
@@ -335,6 +358,28 @@ LogChannelScope::LogChannelScope(const std::string& channel)
 
 LogChannelScope::~LogChannelScope() {
     Logger::instance().setChannel(saved_channel_);
+}
+
+// ================================================================
+// RequestIdScope：RAII 保存/恢复 request_id（A.10.3）
+//
+// 与 LogChannelScope 一致的模式：
+//   - 构造：保存当前值，设置新值
+//   - 析构：恢复保存的值（而非清空）
+//   - 支持嵌套（外层作用域的值被内层恢复）
+//
+// 线程安全：基于 thread_local 的 t_request_id；无共享状态。
+// 异常安全：析构自动调用，栈展开时正常恢复。
+// ================================================================
+
+RequestIdScope::RequestIdScope(const std::string& request_id)
+    : saved_request_id_(Logger::getRequestId())
+{
+    Logger::setRequestId(request_id);
+}
+
+RequestIdScope::~RequestIdScope() {
+    Logger::setRequestId(saved_request_id_);
 }
 
 // ================================================================
@@ -547,6 +592,19 @@ std::string Logger::currentTimestamp() const {
     return oss.str();
 }
 
+// ================================================================
+// formatMessage：日志格式化
+//
+// 格式：
+//   [时间戳][进程名][级别] 内容              （A.10 之前，兼容）
+//   [时间戳][进程名][级别] [req:xxx] 内容     （A.10 之后，request_id 非空时）
+//
+// A.10 D2：
+//   - t_request_id 为空时，不输出 [req:xxx] 前缀——保持向后兼容
+//   - t_request_id 非空时，在级别之后、内容之前插入前缀
+//   - request_id 由上层 setRequestId / clearRequestId / RequestIdScope 控制
+//     （thread_local）
+// ================================================================
 std::string Logger::formatMessage(LogLevel level, const char* file, int line,
                                   const std::string& msg) const {
     (void)file;
@@ -555,8 +613,14 @@ std::string Logger::formatMessage(LogLevel level, const char* file, int line,
     std::ostringstream oss;
     oss << '[' << currentTimestamp() << ']'
         << " [" << process_name_ << ']'
-        << " [" << levelToString(level) << "] "
-        << msg;
+        << " [" << levelToString(level) << "] ";
+
+    // A.10 D2：请求关联 ID 前缀（可选）
+    if (!t_request_id.empty()) {
+        oss << "[req:" << t_request_id << "] ";
+    }
+
+    oss << msg;
     return oss.str();
 }
 

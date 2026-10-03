@@ -34,6 +34,7 @@ namespace dream_machine {
     //   - channel 路由（thread_local 语义，用于插件/脚本日志隔离）
     //   - ERROR 独立文件（DM_LOG_ERROR_SEPARATE=1 启用）
     //   - 信号总线订阅（通过内部 Adapter，方案 D）
+    //   - 请求关联 ID（A.10 D2：thread_local，跨进程日志关联）
     //
     // 信号订阅（方案 D）：
     //   Logger 不直接继承 ISignalSink；内部通过 LoggerSignalAdapter
@@ -81,6 +82,39 @@ namespace dream_machine {
 
         void setChannel(const std::string& channel);
         [[nodiscard]] std::string getChannel() const;
+
+        // ============================================================
+        // 请求关联 ID（A.10 D2）
+        //
+        // 用途：跨进程日志关联。同一请求在不同进程的日志中
+        //       携带同一 request_id，便于时间线分析。
+        //
+        // 语义：
+        //   - thread_local：每个线程独立；当前单线程模型下等价于进程内
+        //   - 为空时：日志格式不输出 [req:xxx] 前缀（向后兼容）
+        //   - 非空时：日志格式输出 [req:xxx] 前缀
+        //
+        // 使用方式（手动）：
+        //   Logger::setRequestId("42");
+        //   LOG_INFO("...");  // 日志中出现 [req:42] 前缀
+        //   Logger::clearRequestId();
+        //
+        // 使用方式（RAII，推荐）：
+        //   {
+        //       RequestIdScope scope("42");   // 构造时 set
+        //       LOG_INFO("...");              // 日志携带 [req:42]
+        //   }                                 // 析构时自动恢复
+        //
+        // 建议使用场景：
+        //   - 收到跨进程请求时：从消息中提取 request_id
+        //   - 处理完毕后：析构自动恢复
+        //
+        // 线程安全：thread_local，无共享状态。
+        // ============================================================
+
+        static void setRequestId(const std::string& request_id);
+        static void clearRequestId();
+        [[nodiscard]] static std::string getRequestId();
 
         // ============================================================
         // 信号总线装配（方案 D）
@@ -185,6 +219,45 @@ namespace dream_machine {
 
     private:
         std::string saved_channel_;
+    };
+
+    // ================================================================
+    // RequestIdScope：request_id 的 RAII 作用域（A.10.3）
+    //
+    // 用法（推荐）：
+    //   {
+    //       RequestIdScope scope("42");     // 构造时 setRequestId("42")
+    //       LOG_INFO("...");                // 日志携带 [req:42] 前缀
+    //       sendResponse();                 // 发出的消息自动携带 request_id
+    //   }  // 析构时自动恢复进入作用域之前的 request_id
+    //
+    // 使用场景：
+    //   - 跨进程消息处理：从消息中读出 request_id 后，进入作用域
+    //   - 处理完毕：作用域结束自动恢复（无需手动 clearRequestId）
+    //
+    // 与手动 setRequestId 的关系：
+    //   - RequestIdScope 内部调用 setRequestId / getRequestId
+    //   - 两者可混用；但推荐优先使用 RAII 形式，避免忘记恢复
+    //
+    // 嵌套：
+    //   - 保存外层 request_id；析构时恢复（而非清空）
+    //   - 与 LogChannelScope 行为一致
+    //
+    // 线程安全：基于 Logger::getRequestId / setRequestId（thread_local），
+    //           同一线程内可嵌套使用；跨线程互不影响。
+    //
+    // 异常安全：析构函数自动调用，栈展开时正常恢复。
+    // ================================================================
+    class RequestIdScope {
+    public:
+        explicit RequestIdScope(const std::string& request_id);
+        ~RequestIdScope();
+
+        RequestIdScope(const RequestIdScope&) = delete;
+        RequestIdScope& operator=(const RequestIdScope&) = delete;
+
+    private:
+        std::string saved_request_id_;
     };
 
 } // namespace dream_machine

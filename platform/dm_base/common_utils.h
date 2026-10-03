@@ -70,24 +70,9 @@ inline bool verifyParentPid(DWORD expected_parent_pid) {
 
 // ================================================================
 // 编码转换：UTF-8 ↔ UTF-16
-//
-// 用途：Win32 API 使用 UTF-16（wchar_t 在 Windows 上为 2 字节），
-//       而项目内部字符串统一使用 UTF-8（std::string）。
-//       在调用 CreateNamedPipeW / CreateFileW 等宽字符 API 前，
-//       需要先做转换。
-//
-// 保守设计：
-//   - 仅提供两个函数，不引入其他编码相关能力
-//   - 转换失败返回空字符串（调用方按"无效输入"处理）
-//   - 不使用 std::filesystem::path 互转（当前无此需求）
-//   - 不做编码检测（当前所有输入均为有效 UTF-8）
-//
-// 注：项目此前的 "std::wstring(str.begin(), str.end())" 是逐字节扩展，
-//     仅对 ASCII 有效。本 helper 保证非 ASCII（中文路径等）正确转换。
 // ================================================================
 
 // UTF-8 → UTF-16
-// 空输入返回空字符串（非错误）
 inline std::wstring utf8ToWide(const std::string& utf8_str) {
     if (utf8_str.empty()) {
         return std::wstring();
@@ -113,7 +98,6 @@ inline std::wstring utf8ToWide(const std::string& utf8_str) {
 }
 
 // UTF-16 → UTF-8
-// 空输入返回空字符串（非错误）
 inline std::string wideToUtf8(const std::wstring& wide_str) {
     if (wide_str.empty()) {
         return std::string();
@@ -142,22 +126,9 @@ inline std::string wideToUtf8(const std::wstring& wide_str) {
 
 // ================================================================
 // 应用根目录与路径解析
-//
-// 背景：所有运行时资源（logs/ / plugins/ / data/）应位于可执行文件
-//       同级目录，保证 bin/ 整体挪走后路径仍正确。
-//       不能依赖当前工作目录（CWD），因为从其他目录启动时 CWD 会变。
-//
-// 实现：使用 Win32 GetModuleFileNameW 获取 exe 绝对路径，不依赖 Qt
-//       或 CWD。任何时机（含 QApplication 创建前）调用都安全。
-//
-// 保守设计：
-//   - 只提供两个函数（根路径 + 相对路径拼接）
-//   - 失败返回空字符串，由调用方处理
-//   - 不做规范化（如 .. 折叠）—— 当前无此需求
 // ================================================================
 
 // 获取应用根目录（可执行文件所在目录，绝对路径，UTF-8）
-// 失败时返回空字符串
 inline std::string getAppRootPath() {
     wchar_t buffer[MAX_PATH];
     const DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
@@ -176,8 +147,6 @@ inline std::string getAppRootPath() {
 }
 
 // 拼接应用根目录下的相对路径
-// relative 为空时返回根目录本身
-// 根目录获取失败时返回空字符串
 inline std::string pathFromRoot(const std::string& relative) {
     std::string root = getAppRootPath();
     if (root.empty()) {
@@ -187,7 +156,6 @@ inline std::string pathFromRoot(const std::string& relative) {
         return root;
     }
 
-    // 规范化分隔符（避免出现 "\\" 与 "/" 混用）
     if (root.back() == '\\' || root.back() == '/') {
         root.pop_back();
     }
@@ -198,20 +166,73 @@ inline std::string pathFromRoot(const std::string& relative) {
 }
 
 // ================================================================
+// getProjectRootPath：项目根目录推断（A.5.2）
+//
+// 用途：从 exe 所在目录向上逐级搜索，找到包含项目标志文件的目录。
+//       不依赖 CWD，不依赖构建目录名（bin/ / out/ / build/ 均可）。
+//
+// 标志文件：src/default_plugin/manifest.json
+//   - 由源码目录结构约定保证存在（详见文档7 §五）
+//   - 若未来目录结构调整，同步更新本函数
+//
+// 搜索策略：
+//   1. 从 exe 所在目录（GetModuleFileNameW 结果）开始
+//   2. 每级检查 <当前>/src/default_plugin/manifest.json 是否存在
+//   3. 存在 → 返回当前目录（UTF-8 绝对路径）
+//   4. 不存在 → 向上一级；最多向上 MAX_UP_LEVELS 级
+//   5. 全部失败 → 返回空字符串
+//
+// 适用场景：
+//   - dev 模式下从源码目录读取资源（DM_DEV_MODE=1）
+//   - 占位窗口等源文件路径解析
+//   - theme_manager 系统模板路径解析
+//
+// 返回值：UTF-8 绝对路径；失败返回空字符串
+//
+// 依据：详见文档13 §1.3 C5、文档8 §八（不依赖 CWD）
+// ================================================================
+inline std::string getProjectRootPath() {
+    wchar_t buffer[MAX_PATH];
+    const DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        LOG_ERROR("getProjectRootPath: GetModuleFileNameW failed: " +
+                  std::to_string(GetLastError()));
+        return {};
+    }
+
+    std::wstring current(buffer, len);
+    const size_t pos = current.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) {
+        LOG_ERROR("getProjectRootPath: no path separator in exe path");
+        return {};
+    }
+    current = current.substr(0, pos);   // exe 所在目录
+
+    constexpr int MAX_UP_LEVELS = 10;
+    constexpr const wchar_t* MARKER = L"src\\default_plugin\\manifest.json";
+
+    for (int level = 0; level < MAX_UP_LEVELS; ++level) {
+        std::wstring candidate = current + L"\\" + MARKER;
+        DWORD attrs = GetFileAttributesW(candidate.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES &&
+            !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            return wideToUtf8(current);
+        }
+
+        const size_t up_pos = current.find_last_of(L"\\/");
+        if (up_pos == std::wstring::npos) {
+            break;
+        }
+        current = current.substr(0, up_pos);
+    }
+
+    LOG_WARN("getProjectRootPath: project root marker not found within " +
+             std::to_string(MAX_UP_LEVELS) + " levels above exe");
+    return {};
+}
+
+// ================================================================
 // request_id 统一生成器
-//
-// 用途：为"请求-响应关联"场景提供进程内唯一 ID。例如：
-//   - 未来的 REQUEST_ENGINE 会话创建请求需关联响应
-//
-// 保守设计：
-//   - 不强制使用：现有 FULL_SYNC 保留自己的生成方式
-//   - 单点定义：所有新调用方从此处获取，避免各进程各自造号
-//   - 单调递增：fetch_add 保证唯一性
-//   - 跨 TU 唯一：inline 函数中的 static 局部变量在 C++ 中唯一
-//
-// 起始值 = 1（0 保留为"未设置"语义，与现有 FullSyncRequestMessage 一致）
-//
-// 线程安全：使用 std::atomic，即使未来引入业务内聚线程也无需修改。
 // ================================================================
 inline int64_t nextRequestId() {
     static std::atomic<int64_t> counter{1};

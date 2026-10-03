@@ -13,9 +13,33 @@ namespace event {
 
 // ================================================================
 // 事件类型
+//
+// 【C6 命名落差 · 诚实标注】
+//
+// 本模块对外命名与日志使用 "event-driven main loop"，
+// 但 READABLE 的实际实现是轮询（PeekNamedPipe + Sleep(10)），
+// 并非真正进入 WaitForMultipleObjects。
+//
+// 当前各事件类型的真实实现：
+//   - WAITABLE  : ✅ 真正进入 WaitForMultipleObjects
+//   - SIGNAL    : ✅ 真正进入 WaitForMultipleObjects
+//   - TIMER     : ⚠ 由 updateTimerEvents() 单独处理（非阻塞轮询）
+//   - READABLE  : ⚠ 轮询检测（isHandleReadable + Sleep(10)）
+//
+// 命名与实现存在落差。修正方向二选一：
+//   A. 诚实标注（当前选择）
+//      —— 改注释与日志文案，说明 READABLE 为轮询语义
+//   B. 改用重叠 I/O（OVERLAPPED + 事件句柄）
+//      —— 引入新复杂度
+//
+// 选择 A 的理由：
+//   改重叠 I/O 与 fail-fast 语义无直接关系，且引入新复杂度；
+//   诚实标注可消除名实不符，成本最低。
+//
+// 依据：详见文档4 §9.3、文档5 §6.6、文档13 §C6。
 // ================================================================
 enum class EventType {
-    READABLE,        // 句柄可读（管道有数据）
+    READABLE,        // 句柄可读（管道有数据）—— 轮询语义，详见上方说明
     TIMER,           // 定时器到期
     SIGNAL_EVENT,    // 手动触发信号
     ERROR_EVENT,     // 错误
@@ -36,7 +60,17 @@ struct EventHandle {
 };
 
 // ================================================================
-// 事件循环（基于 Windows WaitForMultipleObjects）
+// 事件循环
+//
+// 设计意图：基于 Windows WaitForMultipleObjects 的事件驱动主循环。
+//
+// 实际实现（C6 诚实标注）：
+//   - WAITABLE / SIGNAL 真正进入 WaitForMultipleObjects
+//   - TIMER 由 updateTimerEvents() 非阻塞轮询处理
+//   - READABLE 由 isHandleReadable() 轮询检测，非事件驱动
+//
+// 对外命名与日志仍称 "event-driven main loop"，但 READABLE 部分
+// 属于名实不符。详见文件头 EventType 注释。
 // ================================================================
 class EventLoop {
 public:
@@ -51,7 +85,19 @@ public:
     // 事件注册
     // ============================================================
 
-    // 注册可读事件：当 handle 有数据可读时触发回调
+    // 注册可读事件
+    //
+    // 语义：当 handle 有数据可读时触发回调。
+    //
+    // 实现说明（C6 诚实标注）：
+    //   本接口的实际实现是**轮询**——每次 processEvents() 调用
+    //   isHandleReadable() 检测 + Sleep(10) 等待，并非事件驱动。
+    //   命名保留 registerReadable 是为与 WAITABLE / SIGNAL 风格统一，
+    //   但语义上它是"轮询注册"，不是"等待句柄 signaled"。
+    //
+    // 若未来改为重叠 I/O，本接口语义不变，内部实现改为
+    // OVERLAPPED + 事件句柄；届时可移除本说明。
+    //
     // @param handle    Windows 句柄（如命名管道）
     // @param callback  回调函数
     // @param user_data 用户数据
@@ -119,6 +165,12 @@ public:
 
     // ============================================================
     // 静态辅助：检查 handle 是否可读（非阻塞）
+    //
+    // 实现：PeekNamedPipe 检查可读字节数；不消耗数据。
+    //
+    // 说明（C6 诚实标注）：
+    //   这是**轮询**检测函数，registerReadable 内部通过反复调用本函数
+    //   实现"可读事件"。它不是事件驱动——没有句柄 signaled 通知。
     // ============================================================
     static bool isHandleReadable(HANDLE handle);
 

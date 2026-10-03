@@ -1,10 +1,20 @@
-// src/gui/qml/main.qml
-// 占位窗口（fallback），仅在加载超时或出错时显示
-// 正常快速加载时保持隐藏，避免闪烁
+// src/default_plugin/qml/loading.qml
+// Dream Machine 引导 loading 窗口
+//
+// 用途：
+//   GUI 启动 → 显示本窗口 → 等待 launcher 的 INIT_LIST → 加载框架 main.qml
+//   框架加载成功后本窗口隐藏/销毁
+//
+// 与 main.qml 的区别：
+//   - loading.qml：引导窗口（本文件），随系统插件部署
+//   - main.qml   ：框架主窗口（REPLACE 目标），由插件提供
+//
+// 部署位置：
+//   <exe_dir>/plugins/system/dream_machine_default/qml/loading.qml
 //
 // 主题与尺寸来自 globalParams（C++ 注入）：
 //   - 颜色/字体：跟随当前主题模式（light / dark）
-//   - 尺寸：基于屏幕分辨率动态计算（placeholder_width / placeholder_height）
+//   - 尺寸：基于屏幕分辨率动态计算（loading_width / loading_height）
 
 import QtQuick
 import QtQuick.Controls
@@ -102,7 +112,6 @@ ApplicationWindow {
 
         // 退出按钮
         // 保留 Qt 默认样式（跟随 QQuickStyle::setStyle("Fusion")）
-        // 占位窗口较小、临时显示，不做定制
         Button {
             id: exitButton
             Layout.alignment: Qt.AlignHCenter
