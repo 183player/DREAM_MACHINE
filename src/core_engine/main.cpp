@@ -7,6 +7,13 @@
 #include "event_loop.h"
 #include "common_utils.h"
 
+// dm_signal（A.8 装配）
+#include "signal_bus.h"
+#include "message_bridge.h"
+#include "signal_types.h"
+#include "signal_strings.h"
+#include "operation_tracker.h"
+
 #include <string>
 #include <thread>
 #include <chrono>
@@ -16,40 +23,91 @@
 
 using namespace dream_machine;
 using namespace dream_machine::event;
-// 注：不再 using dream_machine::common——
-//     新增的 utf8ToWide / wideToUtf8 / pathFromRoot 用 common:: 前缀显式调用。
 
 namespace {
 
-// 全局状态
+// ================================================================
+// CoreEngineState：core_engine 全局状态收敛载体（A.3.2 C3）
 //
 // 未来重审点（依据 DREAM_MACHINE_CONCURRENCY_MODEL_BOUNDARY 专家裁决 Q4）：
-//   1. 若 core_engine 引入业务内聚线程（如三层漏斗的路由层异步解析），需重审：
-//        - g_executor_pipe / g_monitor_pipe 改为 std::shared_ptr<NamedPipe>
-//        - g_session_id 改为线程安全访问
+//   1. 若 core_engine 引入业务内聚线程（如四层漏斗的路由层异步解析），需重审：
+//        - executor_pipe / monitor_pipe 改为 std::shared_ptr<NamedPipe>
+//        - session_id 改为线程安全访问
 //      注：执行路径（executor 调用）即使多线程也难以调试，搁置优先。
 //   2. 日志生命周期：
 //        启动时调用 archiveLastSessionIfDirty() 检测上次异常退出；
 //        正常退出前调用 markCleanExit() 写入标记。
 //        本文件已调整 setProcessName 顺序以配合多实例日志命名。
-NamedPipe* g_executor_pipe = nullptr;
-NamedPipe* g_monitor_pipe = nullptr;
-EventLoop* g_event_loop = nullptr;
-std::atomic<bool> g_should_stop{false};
-std::string g_session_id;
+// ================================================================
+struct CoreEngineState {
+    // ---- 通信资源 ----
+    NamedPipe* executor_pipe = nullptr;
+    NamedPipe* monitor_pipe = nullptr;
 
-// 消息分发表
-//
-// monitor 侧：迁移了 1 个 handler（SHUTDOWN）。
-// executor 侧：STEP_* / OP_DONE / OP_ABORT 尚未实现，
-//              保持 TODO 原样，未来实现时接入。
-//
-// 回退方式：删除本变量 + registerMonitorMessageHandlers 调用，
-//          并将 processMonitorMessage 恢复为原始 if-else 即可。
-MessageRouter g_monitor_router;
+    // ---- 生命周期 ----
+    EventLoop* event_loop = nullptr;
+    std::atomic<bool> should_stop{false};
+
+    // ---- 会话 ----
+    std::string session_id;
+
+    // ---- 消息分发表 ----
+    MessageRouter monitor_router;
+
+    // ---- 心跳 ----
+    int heartbeat_counter = 0;
+};
+
+static CoreEngineState g_state;
 
 // ----- 前向声明 -----
 void registerMonitorMessageHandlers(MessageRouter& router);
+void attachSignalBus();
+void detachSignalBus();
+
+// ================================================================
+// dm_signal 装配（A.8）
+//
+// 订阅顺序（core_engine）：Logger → OperationTracker → MessageBridge
+// 依据：详见文档13 §3.3、文档5 §7.9
+//
+// 注：
+//   - core_engine 需要 OperationTracker（单会话，统一装配便于一致性）
+//   - Sender 捕获 g_state（static，安全）
+//   - 当前 Sender 占位，待 A.11 完整接入
+// ================================================================
+void attachSignalBus() {
+    Logger::attach_to_signal_bus();
+    signal::SignalBus::instance().subscribe(&signal::OperationTracker::instance());
+    signal::SignalBus::instance().subscribe(&signal::MessageBridge::instance());
+
+    // core_engine → monitor（操作上下文 / 错误通知）
+    (void)signal::MessageBridge::instance().add_sender(
+        "monitor",
+        [](const signal::SignalPayload& payload) -> bool {
+            if (!g_state.monitor_pipe || !g_state.monitor_pipe->isValid()) {
+                return false;
+            }
+            // TODO(A.11)：序列化 SignalPayload → ErrorNotifyMessage / OP_CONTEXT
+            LOG_INFO(std::string("[MessageBridge] signal -> monitor: type=") +
+                     signal::signal_type_to_string(payload.type) +
+                     " | " + payload.description);
+            return true;
+        },
+        [](const signal::SignalPayload& payload) -> bool {
+            return payload.type == signal::SignalType::SGT_OP_CONTEXT ||
+                   payload.type == signal::SignalType::SGT_ERROR_NOTIFY ||
+                   payload.type == signal::SignalType::SGT_ENGINE_DIED;
+        });
+
+    LOG_INFO("dm_signal attached: Logger + OperationTracker + MessageBridge (core_engine)");
+}
+
+void detachSignalBus() {
+    signal::MessageBridge::instance().remove_all_senders();
+    Logger::detach_from_signal_bus();
+    LOG_INFO("dm_signal detached (core_engine)");
+}
 
 // ================================================================
 // monitor 消息 handler 注册
@@ -65,9 +123,9 @@ void registerMonitorMessageHandlers(MessageRouter& router) {
 
             LOG_INFO("Received SHUTDOWN from monitor, reason=" + reason);
 
-            g_should_stop = true;
-            if (g_event_loop) {
-                g_event_loop->stop();
+            g_state.should_stop = true;
+            if (g_state.event_loop) {
+                g_state.event_loop->stop();
             }
         });
 }
@@ -77,16 +135,16 @@ void registerMonitorMessageHandlers(MessageRouter& router) {
 // ================================================================
 void processMonitorMessage(EventType type, void* user_data) {
     (void)type;
-    if (!g_monitor_pipe || g_should_stop) {
+    if (!g_state.monitor_pipe || g_state.should_stop) {
         return;
     }
 
-    NamedPipe& monitor_pipe = *g_monitor_pipe;
+    NamedPipe& monitor_pipe = *g_state.monitor_pipe;
 
     if (monitor_pipe.isBroken()) {
         LOG_INFO("Monitor pipe broken, stopping event loop");
-        if (g_event_loop) {
-            g_event_loop->stop();
+        if (g_state.event_loop) {
+            g_state.event_loop->stop();
         }
         return;
     }
@@ -96,8 +154,8 @@ void processMonitorMessage(EventType type, void* user_data) {
 
     if (peek_result == PipeResult::PIPE_BROKEN) {
         LOG_INFO("Monitor pipe broken (peek), stopping event loop");
-        if (g_event_loop) {
-            g_event_loop->stop();
+        if (g_state.event_loop) {
+            g_state.event_loop->stop();
         }
         return;
     }
@@ -114,7 +172,7 @@ void processMonitorMessage(EventType type, void* user_data) {
 
         std::string type_str, cmd, payload;
         if (parseBaseMessage(message, type_str, cmd, payload)) {
-            if (!g_monitor_router.dispatch(type_str, payload, &monitor_pipe)) {
+            if (!g_state.monitor_router.dispatch(type_str, payload, &monitor_pipe)) {
                 LOG_WARN("Unhandled message type from monitor: " + type_str);
             }
         } else {
@@ -123,8 +181,8 @@ void processMonitorMessage(EventType type, void* user_data) {
 
     } else if (read_result == PipeResult::PIPE_BROKEN) {
         LOG_INFO("Monitor pipe broken (read), stopping event loop");
-        if (g_event_loop) {
-            g_event_loop->stop();
+        if (g_state.event_loop) {
+            g_state.event_loop->stop();
         }
     } else if (read_result == PipeResult::PIPE_TIMEOUT) {
         LOG_WARN("Read timeout on monitor pipe, will retry");
@@ -134,21 +192,20 @@ void processMonitorMessage(EventType type, void* user_data) {
 // ================================================================
 // 处理 executor 消息（回调）
 //
-// 注：executor 侧消息处理尚未实现，保持 TODO 原样。
-//     未来实现时，可参考 monitor 侧接入 MessageRouter。
+// 注：executor 侧消息处理尚未实现（A3），保持 TODO 原样。
 // ================================================================
 void processExecutorMessage(EventType type, void* user_data) {
     (void)type;
-    if (!g_executor_pipe || g_should_stop) {
+    if (!g_state.executor_pipe || g_state.should_stop) {
         return;
     }
 
-    NamedPipe& executor_pipe = *g_executor_pipe;
+    NamedPipe& executor_pipe = *g_state.executor_pipe;
 
     if (executor_pipe.isBroken()) {
         LOG_INFO("Executor pipe broken, stopping event loop");
-        if (g_event_loop) {
-            g_event_loop->stop();
+        if (g_state.event_loop) {
+            g_state.event_loop->stop();
         }
         return;
     }
@@ -158,8 +215,8 @@ void processExecutorMessage(EventType type, void* user_data) {
 
     if (peek_result == PipeResult::PIPE_BROKEN) {
         LOG_INFO("Executor pipe broken (peek), stopping event loop");
-        if (g_event_loop) {
-            g_event_loop->stop();
+        if (g_state.event_loop) {
+            g_state.event_loop->stop();
         }
         return;
     }
@@ -173,12 +230,12 @@ void processExecutorMessage(EventType type, void* user_data) {
 
     if (read_result == PipeResult::PIPE_OK) {
         LOG_INFO("From executor: " + message);
-        // TODO: 处理操作结果（STEP_*, OP_DONE, OP_ABORT）
+        // TODO(A3): 处理操作结果（STEP_*, OP_DONE, OP_ABORT）
 
     } else if (read_result == PipeResult::PIPE_BROKEN) {
         LOG_INFO("Executor pipe broken (read), stopping event loop");
-        if (g_event_loop) {
-            g_event_loop->stop();
+        if (g_state.event_loop) {
+            g_state.event_loop->stop();
         }
     } else if (read_result == PipeResult::PIPE_TIMEOUT) {
         LOG_WARN("Read timeout on executor pipe, will retry");
@@ -188,16 +245,14 @@ void processExecutorMessage(EventType type, void* user_data) {
 // ================================================================
 // 心跳日志（定时回调）
 // ================================================================
-int g_heartbeat_counter = 0;
-
 void logHeartbeat(EventType type, void* user_data) {
     (void)type;
     (void)user_data;
 
-    ++g_heartbeat_counter;
-    if (g_heartbeat_counter % 100 == 0) {
-        LOG_INFO("Core engine heartbeat: " + std::to_string(g_heartbeat_counter) +
-                 " iterations (session: " + g_session_id + ")");
+    ++g_state.heartbeat_counter;
+    if (g_state.heartbeat_counter % 100 == 0) {
+        LOG_INFO("Core engine heartbeat: " + std::to_string(g_state.heartbeat_counter) +
+                 " iterations (session: " + g_state.session_id + ")");
     }
 }
 
@@ -206,22 +261,18 @@ void logHeartbeat(EventType type, void* user_data) {
 // ================================================================
 // main 入口
 //
-// 路径策略（Step 0 路径修正）：
-//   所有运行时资源基于可执行文件所在目录，不依赖 CWD。
+// 路径策略：所有运行时资源基于 exe 目录，不依赖 CWD。
 //
 // 日志生命周期：
-//   core_engine 的顺序较特殊：必须先解析 session_id（决定日志文件名前缀），
-//   再设置进程名，然后才能确定日志目录与归档。
 //   - 启动：解析参数 → setProcessName → setLogDirectory
 //           → archiveLastSessionIfDirty → 开始日志
 //   - 退出：最后一条日志 → markCleanExit → return 0
 //
-// 失败路径（父进程校验、session_id 校验、连接、事件注册失败）不写 .clean_exit：
-// 它们不是正常会话，下次启动时应被识别为异常退出并归档。
+// 失败路径（父进程校验、session_id 校验、连接、事件注册失败）不写 .clean_exit。
 //
-// 日志文件名规则：
-//   session_id 有效 → "core_engine_{session_id}.log"
-//   session_id 缺失 → "core_engine.log"（仅在拒绝运行前记录诊断信息）
+// 本分片合并改动：
+//   A.3.2  C3 全局状态收敛（CoreEngineState g_state）
+//   A.8    dm_signal 装配（Logger + OperationTracker + MessageBridge）
 // ================================================================
 int main(int argc, char* argv[]) {
     // ----- 1. 先解析命令行参数（无日志） -----
@@ -231,19 +282,19 @@ int main(int argc, char* argv[]) {
         expected_parent_pid = static_cast<DWORD>(std::stoul(parent_pid_str));
     }
 
-    g_session_id = common::getArgValue(argc, argv, "--session-id");
+    g_state.session_id = common::getArgValue(argc, argv, "--session-id");
 
     // ----- 2. 设置进程名（依赖 session_id） -----
-    if (g_session_id.empty()) {
+    if (g_state.session_id.empty()) {
         Logger::instance().setProcessName("core_engine");
     } else {
-        Logger::instance().setProcessName("core_engine_" + g_session_id);
+        Logger::instance().setProcessName("core_engine_" + g_state.session_id);
     }
 
-    // ----- 3. 设置日志目录（Step 0 路径修正） -----
+    // ----- 3. 设置日志目录 -----
     Logger::instance().setLogDirectory(common::pathFromRoot("logs"));
 
-    // ----- 4. 归档检测（本轮补齐） -----
+    // ----- 4. 归档检测 -----
     const bool archived_prev = Logger::instance().archiveLastSessionIfDirty();
 
     // ----- 5. 开始日志输出 -----
@@ -253,24 +304,28 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
-    registerMonitorMessageHandlers(g_monitor_router);
+    // A.8：dm_signal 装配
+    attachSignalBus();
+
+    registerMonitorMessageHandlers(g_state.monitor_router);
 
     // ----- 6. 校验父进程 -----
     if (!common::verifyParentPid(expected_parent_pid)) {
+        detachSignalBus();
         return 1;
     }
 
     // ----- 7. 校验 session_id -----
-    if (g_session_id.empty()) {
+    if (g_state.session_id.empty()) {
         LOG_ERROR("Missing --session-id argument, refusing to run");
+        detachSignalBus();
         return 1;
     }
 
-    LOG_INFO("Session ID: " + g_session_id);
+    LOG_INFO("Session ID: " + g_state.session_id);
 
     // ----- 连接到 executor -----
     std::string executor_pipe_name_str = pipe_names::executor_core();
-
     std::wstring executor_pipe_name = common::utf8ToWide(executor_pipe_name_str);
 
     LOG_INFO("Connecting to executor pipe: " + executor_pipe_name_str);
@@ -278,14 +333,14 @@ int main(int argc, char* argv[]) {
     NamedPipe executor_pipe;
     if (!executor_pipe.connect(executor_pipe_name, 5000)) {
         LOG_ERROR("Failed to connect to executor pipe, exiting");
+        detachSignalBus();
         return 1;
     }
 
     LOG_INFO("Connected to executor pipe");
 
     // ----- 连接到 monitor -----
-    std::string monitor_pipe_name_str = pipe_names::monitor_core(g_session_id);
-
+    std::string monitor_pipe_name_str = pipe_names::monitor_core(g_state.session_id);
     std::wstring monitor_pipe_name = common::utf8ToWide(monitor_pipe_name_str);
 
     LOG_INFO("Connecting to monitor pipe: " + monitor_pipe_name_str);
@@ -293,6 +348,7 @@ int main(int argc, char* argv[]) {
     NamedPipe monitor_pipe;
     if (!monitor_pipe.connect(monitor_pipe_name, 5000)) {
         LOG_ERROR("Failed to connect to monitor pipe, exiting");
+        detachSignalBus();
         return 1;
     }
 
@@ -300,11 +356,12 @@ int main(int argc, char* argv[]) {
 
     // ----- 发送 REGISTER_SESSION -----
     RegisterSessionMessage reg_msg;
-    reg_msg.session_id = g_session_id;
+    reg_msg.session_id = g_state.session_id;
     std::string register_msg = serializeRegisterSession(reg_msg);
 
     if (monitor_pipe.writeLine(register_msg) != PipeResult::PIPE_OK) {
         LOG_ERROR("Failed to send REGISTER_SESSION to monitor, exiting");
+        detachSignalBus();
         return 1;
     }
     LOG_INFO("REGISTER_SESSION sent to monitor: " + register_msg);
@@ -312,40 +369,33 @@ int main(int argc, char* argv[]) {
     // ============================================================
     // 初始化事件循环
     // ============================================================
-    g_executor_pipe = &executor_pipe;
-    g_monitor_pipe = &monitor_pipe;
+    g_state.executor_pipe = &executor_pipe;
+    g_state.monitor_pipe = &monitor_pipe;
 
     EventLoop event_loop;
-    g_event_loop = &event_loop;
+    g_state.event_loop = &event_loop;
 
     EventHandle monitor_read_handle = event_loop.registerReadable(
-        monitor_pipe.getHandle(),
-        processMonitorMessage,
-        nullptr
-    );
+        monitor_pipe.getHandle(), processMonitorMessage, nullptr);
     if (!monitor_read_handle.active) {
         LOG_ERROR("Failed to register monitor pipe readable event");
+        detachSignalBus();
         return 1;
     }
 
     EventHandle executor_read_handle = event_loop.registerReadable(
-        executor_pipe.getHandle(),
-        processExecutorMessage,
-        nullptr
-    );
+        executor_pipe.getHandle(), processExecutorMessage, nullptr);
     if (!executor_read_handle.active) {
         LOG_ERROR("Failed to register executor pipe readable event");
+        detachSignalBus();
         return 1;
     }
 
     EventHandle heartbeat_handle = event_loop.registerTimer(
-        100,
-        logHeartbeat,
-        nullptr,
-        false
-    );
+        100, logHeartbeat, nullptr, false);
     if (!heartbeat_handle.active) {
         LOG_ERROR("Failed to register heartbeat timer");
+        detachSignalBus();
         return 1;
     }
 
@@ -353,7 +403,7 @@ int main(int argc, char* argv[]) {
         (void)type;
         (void)data;
         LOG_INFO("Stop signal received");
-        g_should_stop = true;
+        g_state.should_stop = true;
     });
     if (!stop_signal.active) {
         LOG_WARN("Failed to register stop signal");
@@ -367,7 +417,7 @@ int main(int argc, char* argv[]) {
     // ============================================================
     LOG_INFO("Sending UNREGISTER_SESSION to monitor...");
     UnregisterSessionMessage unreg_msg;
-    unreg_msg.session_id = g_session_id;
+    unreg_msg.session_id = g_state.session_id;
     std::string unregister_msg = serializeUnregisterSession(unreg_msg);
     (void)monitor_pipe.writeLine(unregister_msg);
 
@@ -384,11 +434,14 @@ int main(int argc, char* argv[]) {
     monitor_pipe.close();
     executor_pipe.close();
 
-    g_executor_pipe = nullptr;
-    g_monitor_pipe = nullptr;
-    g_event_loop = nullptr;
+    g_state.executor_pipe = nullptr;
+    g_state.monitor_pipe = nullptr;
+    g_state.event_loop = nullptr;
 
-    LOG_INFO("=== Core Engine exited (session: " + g_session_id + ") ===");
+    // A.8：dm_signal 卸载
+    detachSignalBus();
+
+    LOG_INFO("=== Core Engine exited (session: " + g_state.session_id + ") ===");
 
     Logger::instance().markCleanExit();
 

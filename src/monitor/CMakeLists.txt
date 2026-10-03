@@ -7,4 +7,5 @@ target_link_libraries(monitor PRIVATE
         dm_pipe
         dm_process
         dm_event
+        dm_signal      # A.8：显式 link（dm_logger 依赖为 PRIVATE，不传递）
 )

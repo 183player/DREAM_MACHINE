@@ -189,7 +189,7 @@ void ThemeManager::loadFromFiles() {
 }
 
 QVariantMap ThemeManager::readSystemTemplate() const {
-    // 生产路径
+    // 生产路径（基于 exe 目录，不依赖 CWD）
     QString sys_path = QString::fromStdString(
         common::pathFromRoot(SYS_TEMPLATE_RELATIVE));
     QVariantMap sys_template = readJsonFile(sys_path);
@@ -197,18 +197,16 @@ QVariantMap ThemeManager::readSystemTemplate() const {
         return sys_template;
     }
 
-    // dev 路径
+    // dev 路径（A.5.2：marker 搜索，不依赖 CWD、不依赖目录名）
     if (isDevMode()) {
-        QString project_root = QDir::currentPath();
-        QDir proj_dir(project_root);
-        if (proj_dir.dirName() == "bin") {
-            proj_dir.cdUp();
-            proj_dir.cdUp();
-        }
-        QString dev_path = proj_dir.filePath(QString::fromUtf8(SYS_TEMPLATE_DEV_RELATIVE));
-        sys_template = readJsonFile(dev_path);
-        if (!sys_template.isEmpty()) {
-            return sys_template;
+        QString root = QString::fromStdString(common::getProjectRootPath());
+        if (!root.isEmpty()) {
+            QString dev_path = QDir(root).filePath(
+                QString::fromUtf8(SYS_TEMPLATE_DEV_RELATIVE));
+            sys_template = readJsonFile(dev_path);
+            if (!sys_template.isEmpty()) {
+                return sys_template;
+            }
         }
     }
 
@@ -226,7 +224,6 @@ QStringList ThemeManager::extractModesFromTemplate(const QVariantMap& sys_templa
     for (auto it = modes.begin(); it != modes.end(); ++it) {
         result.push_back(it.key());
     }
-    // 稳定排序：light 在前，dark 在后，其他按字母序
     result.sort();
     return result;
 }

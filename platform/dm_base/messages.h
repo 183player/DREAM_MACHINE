@@ -74,17 +74,41 @@ namespace msg_types {
 }
 
 // ================================================================
-// 协议版本（阶段 1.7 B4）
+// 协议版本（阶段 1.7 B4 + A.9 最小协商）
 //
 // buildMessage 自动将 version 写入所有消息，parseBaseMessage 读取。
-// 当前设计（保守）：
-//   - 只提供字段与常量，不做版本协商
-//   - 版本不匹配仅记录 WARN，仍继续处理（不拒绝）
-//   - 未来若需协商，可在此基础上扩展
+//
+// 本阶段 A.9 落地"最小协商"：
+//   - 定义支持范围 [MIN_SUPPORTED, CURRENT]
+//   - 提供 isCompatible() 判定辅助（inline constexpr，零开销）
+//   - parseBaseMessage 检查对端 version；不兼容仅记录 WARN，不拒绝
+//
+// 设计原则（保守）：
+//   - 不做版本回退、不做降级、不做双向协商
+//   - 不兼容时仍继续处理（与 messages.cpp 中现有行为一致）
+//   - 未来若需真正协商，可在此基础上扩展（如握手消息）
 // ================================================================
 namespace msg_version {
+
+    // 当前协议版本（buildMessage 写入的默认值）
     inline constexpr int CURRENT = 1;
-}
+
+    // 本端支持的最低版本
+    // 对端版本 < MIN_SUPPORTED 或 > CURRENT 视为不兼容
+    inline constexpr int MIN_SUPPORTED = 1;
+
+    // 版本兼容性判定
+    //
+    // 语义：
+    //   - remote 在 [MIN_SUPPORTED, CURRENT] 范围内 → 兼容
+    //   - 其他情况 → 不兼容（仅记录 WARN，不拒绝）
+    //
+    // 注：inline constexpr 无运行时开销；调用方按需使用。
+    [[nodiscard]] inline constexpr bool isCompatible(int remote_version) {
+        return remote_version >= MIN_SUPPORTED && remote_version <= CURRENT;
+    }
+
+} // namespace msg_version
 
 // ================================================================
 // SHUTDOWN 消息受控常量
@@ -112,13 +136,15 @@ namespace shutdown_initiator {
 // ================================================================
 
 // ---- 基础消息 ----
-// version 由 buildMessage 自动写入，parseBaseMessage 读取。
-// 现有调用点无需感知；需要版本感知时可使用新增的 parseBaseMessage 重载。
+// version    由 buildMessage 自动写入，parseBaseMessage 读取。
+// request_id 由 buildMessage 从 Logger::getRequestId() 自动获取并写入；
+//            为空时不写入 JSON（向后兼容）。
 struct BaseMessage {
     std::string type;
     std::string cmd;
     std::string payload;
     int version = msg_version::CURRENT;
+    std::string request_id;
 };
 
 // ---- 注册 ----
@@ -361,12 +387,22 @@ std::optional<EngineDiedMessage> parseEngineDied(const std::string& json);
 // 通用辅助函数
 // ================================================================
 
-// 构建消息 JSON。自动写入 version = msg_version::CURRENT。
+// 构建消息 JSON
+//
+// 自动写入：
+//   - version    = msg_version::CURRENT
+//   - request_id = Logger::getRequestId()（非空时写入；A.10 D2）
+//
+// 说明：
+//   - request_id 由 Logger thread_local 提供，各进程通过
+//     Logger::setRequestId / clearRequestId 控制
+//   - request_id 为空时 JSON 不写字段，向后兼容
+//   - 各 serializeXxx 内部调用本函数，因此零改动即自动携带
 std::string buildMessage(const std::string& type,
                          const std::string& cmd,
                          const std::string& payload_json);
 
-// 解析消息基字段（兼容版本：忽略 version）
+// 解析消息基字段（兼容版本：忽略 version 与 request_id）
 // 保留此签名以保证现有调用点零改动。
 bool parseBaseMessage(const std::string& json,
                       std::string& out_type,
@@ -374,11 +410,24 @@ bool parseBaseMessage(const std::string& json,
                       std::string& out_payload);
 
 // 解析消息基字段（带版本）
-// 用于未来需要版本感知的调用点。缺字段时 out_version 给 CURRENT。
+// 用于需要版本感知但不需要 request_id 的调用点。
+// 缺字段时 out_version 给 CURRENT。
+// A.9：本重载内部会做版本兼容性检查；不兼容时首次记录 WARN（不拒绝）。
 bool parseBaseMessage(const std::string& json,
                       std::string& out_type,
                       std::string& out_cmd,
                       std::string& out_payload,
                       int& out_version);
+
+// 解析消息基字段（带版本 + request_id）
+// A.10 D2：新增重载，读出对端携带的 request_id。
+// 缺字段时 out_request_id 给空字符串。
+// A.9：本重载内部会做版本兼容性检查；不兼容时首次记录 WARN（不拒绝）。
+bool parseBaseMessage(const std::string& json,
+                      std::string& out_type,
+                      std::string& out_cmd,
+                      std::string& out_payload,
+                      int& out_version,
+                      std::string& out_request_id);
 
 } // namespace dream_machine

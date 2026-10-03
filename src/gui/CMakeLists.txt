@@ -42,6 +42,7 @@ target_link_libraries(gui PRIVATE
         dm_logger
         dm_base
         dm_pipe
+        dm_signal      # A.8：显式 link（dm_logger 依赖为 PRIVATE，不传递）
 )
 
 # 包含目录

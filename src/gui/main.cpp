@@ -9,6 +9,14 @@
 #include "status_provider.h"
 #include "theme_manager.h"
 #include "common_utils.h"
+#include "error_codes.h"
+#include "error_notify_bridge.h"
+
+// dm_signal（A.8 装配）
+#include "signal_bus.h"
+#include "message_bridge.h"
+#include "signal_types.h"
+#include "signal_strings.h"
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -38,8 +46,6 @@
 
 using namespace dream_machine;
 using namespace dream_machine::gui;
-// 注：不再 using dream_machine::common——
-//     新增的 utf8ToWide / wideToUtf8 / pathFromRoot 用 common:: 前缀显式调用。
 
 // ================================================================
 // 未来重审点（依据 DREAM_MACHINE_CONCURRENCY_MODEL_BOUNDARY 专家裁决 Q4）：
@@ -62,9 +68,9 @@ static QPointer<QQmlApplicationEngine> g_engine;
 static std::unique_ptr<PluginLoader> g_pluginLoader;
 static QPointer<StatusProvider> g_statusProvider;
 static std::unique_ptr<ThemeManager> g_themeManager;
-static QPointer<QObject> g_placeholderWindow;
+static QPointer<QObject> g_loadingWindow;
 static std::unique_ptr<QTimer> g_timeoutTimer;
-static std::unique_ptr<QTimer> g_showPlaceholderTimer;
+static std::unique_ptr<QTimer> g_showLoadingTimer;
 static std::atomic<bool> g_should_stop{false};
 
 // 消息分发表
@@ -79,6 +85,13 @@ namespace {
 void handleInitList(const std::string& payload);
 void handleInitSessionList(const std::string& payload);
 void handleSessionStateUpdate(const std::string& payload);
+void attachSignalBus();
+void detachSignalBus();
+void publish_error(ErrorCode code,
+                   ErrorSeverity severity,
+                   const std::string& message,
+                   const std::string& details = "",
+                   const std::string& session_id = "");
 
 bool isDevMode() {
     const char* dev_mode = std::getenv("DM_DEV_MODE");
@@ -86,8 +99,83 @@ bool isDevMode() {
 }
 
 // ================================================================
+// publish_error：通过 SignalBus 发布结构化错误（A.11.2b-3 B3 接线）
+// ================================================================
+void publish_error(ErrorCode code,
+                   ErrorSeverity severity,
+                   const std::string& message,
+                   const std::string& details,
+                   const std::string& session_id) {
+    signal::SignalPayload payload;
+    payload.type = signal::SignalType::SGT_ERROR_NOTIFY;
+    payload.level = static_cast<signal::SignalLevel>(
+        error_severity_to_signal_level_int(severity));
+    payload.timestamp_ms = signal::now_ms();
+    payload.description = message;
+    payload.detail = details;
+    if (!session_id.empty()) {
+        payload.session_id = session_id;
+    }
+    payload.extra["error_code"] = errorCodeToString(code);
+
+    signal::SignalBus::instance().publish(payload);
+}
+
+// ================================================================
+// dm_signal 装配（A.8 装配 + A.11.2b-3 Sender 完整实现）
+// ================================================================
+void attachSignalBus() {
+    Logger::attach_to_signal_bus();
+    signal::SignalBus::instance().subscribe(&signal::MessageBridge::instance());
+
+    (void)signal::MessageBridge::instance().add_sender(
+        "launcher",
+        [](const signal::SignalPayload& payload) -> bool {
+            if (!g_pipe || !g_pipe->isValid()) {
+                return false;
+            }
+
+            ErrorNotifyMessage notify;
+            notify.source = "gui";
+            notify.severity = signal::signal_level_to_string(payload.level);
+            notify.message = payload.description;
+
+            std::string details = payload.detail;
+            auto it_code = payload.extra.find("error_code");
+            if (it_code != payload.extra.end() && !it_code->second.empty()) {
+                if (!details.empty()) {
+                    details += " | ";
+                }
+                details += std::string("code=") + it_code->second;
+            }
+            if (!details.empty()) {
+                notify.details = details;
+            }
+
+            std::string json = serializeErrorNotify(notify);
+            PipeResult result = g_pipe->writeLine(json);
+            if (result == PipeResult::PIPE_OK) {
+                LOG_INFO("ErrorNotify sent to launcher: " + payload.description);
+                return true;
+            }
+            LOG_WARN("Failed to send ErrorNotify to launcher");
+            return false;
+        },
+        [](const signal::SignalPayload& payload) -> bool {
+            return payload.type == signal::SignalType::SGT_ERROR_NOTIFY;
+        });
+
+    LOG_INFO("dm_signal attached: Logger + MessageBridge (gui)");
+}
+
+void detachSignalBus() {
+    signal::MessageBridge::instance().remove_all_senders();
+    Logger::detach_from_signal_bus();
+    LOG_INFO("dm_signal detached (gui)");
+}
+
+// ================================================================
 // 读取 JSON 文件 → QVariantMap
-// 失败返回空 map
 // ================================================================
 QVariantMap readJsonFile(const QString& path) {
     QFile file(path);
@@ -109,11 +197,6 @@ QVariantMap readJsonFile(const QString& path) {
 
 // ================================================================
 // 深度合并两个 QVariantMap
-//
-// 规则：
-//   - override 中的键覆盖 base 中的同名键
-//   - 若双方的值都是 map，递归合并
-//   - 否则 override 直接覆盖
 // ================================================================
 QVariantMap deepMergeMap(const QVariantMap& base, const QVariantMap& override) {
     QVariantMap result = base;
@@ -181,27 +264,7 @@ QVariantMap extractColorsForMode(const QVariantMap& sys_template,
 }
 
 // ================================================================
-// 计算启动时的窗口尺寸（主窗口 + 占位窗口）
-//
-// 主窗口初始尺寸：
-//   w = clamp(screen_w × ratio_w, min_w, max_w)
-//   h = clamp(screen_h × ratio_h, min_h, max_h)
-//   用户可后续拉伸；min_window_* 是最小尺寸约束（QML 侧 minWidth/minHeight）
-//
-// 占位窗口尺寸：
-//   scale = clamp(screen_w / ref_w, scale_min, scale_max)
-//   w = placeholder_width_base × scale
-//   h = placeholder_height_base × scale
-//
-// 说明：
-//   QScreen::availableGeometry() 返回逻辑像素（已考虑系统 DPI 缩放）。
-//   因此无需额外处理 DPI。
-//
-// 注入字段：
-//   layout.initial_window_width   → 主窗口初始宽
-//   layout.initial_window_height  → 主窗口初始高
-//   layout.placeholder_width      → 占位窗口宽
-//   layout.placeholder_height     → 占位窗口高
+// 计算启动时的窗口尺寸（主窗口 + loading 窗口）
 // ================================================================
 void computeLayoutDimensions(QVariantMap& global_params) {
     QVariantMap layout = global_params.value("layout").toMap();
@@ -210,7 +273,6 @@ void computeLayoutDimensions(QVariantMap& global_params) {
         return;
     }
 
-    // ----- 读取基准值（含兜底默认） -----
     const int min_w         = layout.value("min_window_width", 800).toInt();
     const int min_h         = layout.value("min_window_height", 600).toInt();
     const double ratio_w    = layout.value("initial_window_width_ratio", 0.6).toDouble();
@@ -224,7 +286,6 @@ void computeLayoutDimensions(QVariantMap& global_params) {
     const double ph_min     = layout.value("placeholder_scale_min", 1.0).toDouble();
     const double ph_max     = layout.value("placeholder_scale_max", 1.5).toDouble();
 
-    // ----- 获取屏幕信息 -----
     QScreen* screen = QGuiApplication::primaryScreen();
     if (!screen) {
         LOG_WARN("computeLayoutDimensions: no primary screen, using min sizes");
@@ -240,7 +301,6 @@ void computeLayoutDimensions(QVariantMap& global_params) {
     const int screen_w = geo.width();
     const int screen_h = geo.height();
 
-    // ----- 计算主窗口初始尺寸 -----
     int initial_w = static_cast<int>(screen_w * ratio_w);
     int initial_h = static_cast<int>(screen_h * ratio_h);
 
@@ -252,7 +312,6 @@ void computeLayoutDimensions(QVariantMap& global_params) {
     layout["initial_window_width"]  = initial_w;
     layout["initial_window_height"] = initial_h;
 
-    // ----- 计算占位窗口尺寸 -----
     double scale = (ph_ref_w > 0)
                    ? static_cast<double>(screen_w) / ph_ref_w
                    : 1.0;
@@ -274,9 +333,7 @@ void computeLayoutDimensions(QVariantMap& global_params) {
 }
 
 // ================================================================
-// 硬编码兜底（系统模板 + dev 模式都读不到时使用）
-//
-// 含 layout 基准值——computeLayoutDimensions 依赖这些字段计算。
+// 硬编码兜底
 // ================================================================
 QVariantMap buildHardcodedDefaults() {
     QVariantMap result;
@@ -352,19 +409,14 @@ QVariantMap buildHardcodedDefaults() {
 }
 
 // ================================================================
-// 加载全局参数（供 QML 使用的扁平结构）
+// 加载全局参数
 //
-// 加载顺序：
-//   1. 系统模板（生产路径；dev 路径回退）
-//   2. 用户偏好（data/theme_preferences.json，可能不存在）
-//   3. 主题模式：用户主题模式 > 系统 default_mode > "light"
-//   4. 从系统模板提取对应模式的基础 colors（带回退）
-//   5. 深度合并（用户偏好优先）每个字段
-//   6. 计算窗口尺寸（computeLayoutDimensions）
-//   7. 返回 { colors, fonts, spacing, layout, animation }
+// 路径策略（不依赖 CWD）：
+//   1. 系统插件模板：common::pathFromRoot("plugins/system/...")（部署+编译版）
+//   2. dev 兜底：getProjectRoot() + 源码路径（仅 DM_DEV_MODE=1）
+//   3. 兜底：硬编码 + publish_error
 // ================================================================
 QVariantMap loadGlobalParams() {
-    // ----- 1. 读系统模板 -----
     QVariantMap sys_template;
 
     {
@@ -377,28 +429,27 @@ QVariantMap loadGlobalParams() {
     }
 
     if (sys_template.isEmpty() && isDevMode()) {
-        QString project_root = QDir::currentPath();
-        QDir proj_dir(project_root);
-        if (proj_dir.dirName() == "bin") {
-            proj_dir.cdUp();
-            proj_dir.cdUp();
-        }
-        QString dev_path = proj_dir.filePath("src/default_plugin/config/global_params.json");
-        sys_template = readJsonFile(dev_path);
-        if (!sys_template.isEmpty()) {
-            LOG_INFO("global_params.json loaded from (dev): " + dev_path.toStdString());
+        QString root = QString::fromStdString(common::getProjectRootPath());
+        if (!root.isEmpty()) {
+            QString dev_path = QDir(root).filePath("src/default_plugin/config/global_params.json");
+            sys_template = readJsonFile(dev_path);
+            if (!sys_template.isEmpty()) {
+                LOG_INFO("global_params.json loaded from (dev): " + dev_path.toStdString());
+            }
         }
     }
 
-    // ----- 完全读不到 → 硬编码兜底 + 计算尺寸 -----
     if (sys_template.isEmpty()) {
         LOG_WARN("System template not found, using hardcoded defaults");
+        publish_error(ErrorCode::CONFIG_NOT_FOUND,
+                      ErrorSeverity::WARNING,
+                      "System template not found, using hardcoded defaults",
+                      "plugins/system/dream_machine_default/config/global_params.json");
         QVariantMap result = buildHardcodedDefaults();
         computeLayoutDimensions(result);
         return result;
     }
 
-    // ----- 2. 读用户偏好 -----
     QString user_path = QString::fromStdString(
         common::pathFromRoot("data/theme_preferences.json"));
     QVariantMap user_prefs = readJsonFile(user_path);
@@ -406,7 +457,6 @@ QVariantMap loadGlobalParams() {
         LOG_INFO("theme_preferences.json loaded from: " + user_path.toStdString());
     }
 
-    // ----- 3. 确定主题模式 -----
     QString mode = user_prefs.value("theme_mode").toString();
     if (mode.isEmpty()) {
         QVariantMap theme = sys_template.value("theme").toMap();
@@ -417,10 +467,8 @@ QVariantMap loadGlobalParams() {
     }
     LOG_INFO("Theme mode resolved to: " + mode.toStdString());
 
-    // ----- 4. 提取基础 colors（带回退） -----
     QVariantMap base_colors = extractColorsForMode(sys_template, mode);
 
-    // ----- 5. 深度合并每类字段 -----
     QVariantMap result;
     result["colors"]    = deepMergeMap(base_colors,
                                        user_prefs.value("colors").toMap());
@@ -433,18 +481,17 @@ QVariantMap loadGlobalParams() {
     result["animation"] = deepMergeMap(sys_template.value("animation").toMap(),
                                        user_prefs.value("animation").toMap());
 
-    // ----- 6. 计算窗口尺寸（注入 initial_window_* / placeholder_*） -----
     computeLayoutDimensions(result);
 
     return result;
 }
 
-void showPlaceholderWindow() {
-    if (g_placeholderWindow) {
-        QQuickWindow* win = qobject_cast<QQuickWindow*>(g_placeholderWindow.data());
+void showLoadingWindow() {
+    if (g_loadingWindow) {
+        QQuickWindow* win = qobject_cast<QQuickWindow*>(g_loadingWindow.data());
         if (win && !win->isVisible()) {
             win->setVisible(true);
-            LOG_INFO("Placeholder window shown due to loading delay");
+            LOG_INFO("Loading window shown due to loading delay");
         }
     }
     if (g_statusProvider) {
@@ -453,20 +500,27 @@ void showPlaceholderWindow() {
     }
 }
 
-void hidePlaceholderWindow() {
-    if (g_showPlaceholderTimer) {
-        g_showPlaceholderTimer->stop();
+void hideLoadingWindow() {
+    if (g_showLoadingTimer) {
+        g_showLoadingTimer->stop();
     }
-    if (g_placeholderWindow) {
-        g_placeholderWindow->deleteLater();
-        g_placeholderWindow.clear();
-        LOG_INFO("Placeholder window destroyed");
+    if (g_loadingWindow) {
+        g_loadingWindow->deleteLater();
+        g_loadingWindow.clear();
+        LOG_INFO("Loading window destroyed");
     }
 }
 
+// ================================================================
+// handleInitList
+// ================================================================
 void handleInitList(const std::string& payload) {
     if (!g_pluginLoader || !g_statusProvider) {
         LOG_ERROR("PluginLoader or StatusProvider not initialized");
+        publish_error(ErrorCode::PLUGIN_LOAD_FAILED,
+                      ErrorSeverity::FATAL,
+                      "PluginLoader or StatusProvider not initialized",
+                      "handleInitList invoked before initialization");
         return;
     }
 
@@ -477,7 +531,7 @@ void handleInitList(const std::string& payload) {
     if (success) {
         g_statusProvider->setStatusText("插件加载成功");
         g_statusProvider->setLoading(false);
-        hidePlaceholderWindow();
+        hideLoadingWindow();
 
         if (g_timeoutTimer) {
             g_timeoutTimer->stop();
@@ -501,12 +555,17 @@ void handleInitList(const std::string& payload) {
         g_statusProvider->setLoading(false);
         g_statusProvider->setShowExitButton(true);
 
-        if (g_showPlaceholderTimer) {
-            g_showPlaceholderTimer->stop();
+        if (g_showLoadingTimer) {
+            g_showLoadingTimer->stop();
         }
-        showPlaceholderWindow();
+        showLoadingWindow();
 
         LOG_ERROR("Failed to load plugins from INIT_LIST");
+        publish_error(ErrorCode::PLUGIN_LOAD_FAILED,
+                      ErrorSeverity::WARNING,
+                      "Failed to load plugins from INIT_LIST",
+                      "loadFromInitList returned false");
+
         InitListAckMessage ack;
         ack.status = "error";
         ack.error = "Failed to load plugins";
@@ -525,6 +584,10 @@ void handleInitSessionList(const std::string& payload) {
     auto msg = parseInitSessionList(payload);
     if (!msg.has_value()) {
         LOG_WARN("Failed to parse INIT_SESSION_LIST");
+        publish_error(ErrorCode::JSON_ERROR,
+                      ErrorSeverity::WARNING,
+                      "Failed to parse INIT_SESSION_LIST",
+                      "parseInitSessionList returned nullopt");
         return;
     }
     g_sessionManager->clearAll();
@@ -539,6 +602,10 @@ void handleSessionStateUpdate(const std::string& payload) {
     auto msg = parseSessionStateUpdate(payload);
     if (!msg.has_value()) {
         LOG_WARN("Failed to parse SESSION_STATE_UPDATE message");
+        publish_error(ErrorCode::JSON_ERROR,
+                      ErrorSeverity::WARNING,
+                      "Failed to parse SESSION_STATE_UPDATE",
+                      "parseSessionStateUpdate returned nullopt");
         return;
     }
 
@@ -596,6 +663,10 @@ void pollPipe() {
 
     if (g_pipe->isBroken()) {
         LOG_WARN("Pipe broken, quitting GUI");
+        publish_error(ErrorCode::PIPE_BROKEN,
+                      ErrorSeverity::FATAL,
+                      "Launcher pipe broken",
+                      "isBroken() returned true");
         QApplication::quit();
         return;
     }
@@ -605,6 +676,10 @@ void pollPipe() {
 
     if (peek_result == PipeResult::PIPE_BROKEN) {
         LOG_WARN("Pipe broken (peek), quitting GUI");
+        publish_error(ErrorCode::PIPE_BROKEN,
+                      ErrorSeverity::FATAL,
+                      "Launcher pipe broken (peek)",
+                      "peekAvailable returned PIPE_BROKEN");
         QApplication::quit();
         return;
     }
@@ -623,10 +698,18 @@ void pollPipe() {
                 }
             } else {
                 LOG_WARN("Failed to parse base message");
+                publish_error(ErrorCode::JSON_ERROR,
+                              ErrorSeverity::WARNING,
+                              "Failed to parse base message from launcher",
+                              "parseBaseMessage returned false");
             }
 
         } else if (read_result == PipeResult::PIPE_BROKEN) {
             LOG_WARN("Pipe broken (read), quitting GUI");
+            publish_error(ErrorCode::PIPE_BROKEN,
+                          ErrorSeverity::FATAL,
+                          "Launcher pipe broken (read)",
+                          "readLine returned PIPE_BROKEN");
             QApplication::quit();
         } else if (read_result == PipeResult::PIPE_TIMEOUT) {
             LOG_WARN("Read timeout, will retry");
@@ -635,10 +718,10 @@ void pollPipe() {
 }
 
 void onTimeout() {
-    if (g_showPlaceholderTimer) {
-        g_showPlaceholderTimer->stop();
+    if (g_showLoadingTimer) {
+        g_showLoadingTimer->stop();
     }
-    showPlaceholderWindow();
+    showLoadingWindow();
 
     if (g_statusProvider) {
         g_statusProvider->setStatusText("加载超时");
@@ -647,6 +730,10 @@ void onTimeout() {
         g_statusProvider->setShowExitButton(true);
     }
     LOG_ERROR("Timeout waiting for INIT_LIST");
+    publish_error(ErrorCode::TIMEOUT,
+                  ErrorSeverity::WARNING,
+                  "Timeout waiting for INIT_LIST",
+                  "10s timer expired before INIT_LIST received");
 }
 
 } // namespace
@@ -654,30 +741,15 @@ void onTimeout() {
 // ================================================================
 // main 入口
 //
-// 路径策略（Step 0 路径修正）：
-//   所有运行时资源基于可执行文件所在目录，不依赖 CWD。
+// 路径策略（部署即用、跨机可移植）：
+//   - 所有运行时资源基于 exe 目录（common::pathFromRoot）
+//   - 无绝对路径硬编码；复制 bin/ 整体到任意位置可运行
+//   - loading 窗口是**必要组件**（随系统插件部署）
 //
-// 日志生命周期：
-//   - 启动：setProcessName → setLogDirectory → archiveLastSessionIfDirty → 开始日志
-//   - 退出：最后一条日志 → markCleanExit → return 0
-//
-// QML 样式（Step 1 警告修复）：
-//   QQuickStyle::setStyle("Fusion") 使 Qt Quick Controls 2 允许
-//   覆盖 background / contentItem 等属性。
-//
-// 主题系统（Step 3 / Step 4）：
-//   - loadGlobalParams() 启动时读系统模板 + 用户偏好，注入 QML
-//   - ThemeManager 提供运行时切换（写入 data/theme_preferences.json）
-//   - 切换需重启生效（不重载 QML）
-//
-// 窗口尺寸（Step 4.5）：
-//   - 启动时基于主屏幕分辨率计算：
-//       主窗口初始尺寸（基于比例 + 上下限）
-//       占位窗口尺寸（基于基准值 × 分辨率缩放）
-//   - QML 侧读 globalParams.layout.initial_window_* / placeholder_*
-//   - 用户可自由拉伸；最小尺寸由 min_window_* 约束
-//
-// 失败路径不写 .clean_exit：它们不是正常会话，下次启动应被归档。
+// 本分片合并改动：
+//   A.8        dm_signal 装配
+//   A.11.2b-3  B3 错误结构化接线
+//   A.5        C5 GUI 路径统一（loading 窗口纳入默认插件）
 // ================================================================
 int main(int argc, char* argv[]) {
     Logger::instance().setProcessName("gui");
@@ -692,6 +764,8 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Previous session logs archived to logs/crashes/");
     }
 
+    attachSignalBus();
+
     registerMessageHandlers(g_message_router);
 
     std::string parent_pid_str = common::getArgValue(argc, argv, "--parent-pid");
@@ -701,6 +775,11 @@ int main(int argc, char* argv[]) {
     }
 
     if (!common::verifyParentPid(expected_parent_pid)) {
+        publish_error(ErrorCode::PROCESS_LAUNCH_FAILED,
+                      ErrorSeverity::FATAL,
+                      "Parent PID verification failed",
+                      "verifyParentPid returned false");
+        detachSignalBus();
         return 1;
     }
 
@@ -713,6 +792,11 @@ int main(int argc, char* argv[]) {
     auto pipe = std::make_unique<NamedPipe>();
     if (!pipe->connect(pipe_name, 5000)) {
         LOG_ERROR("Failed to connect to launcher pipe, exiting");
+        publish_error(ErrorCode::PIPE_CONNECT_FAILED,
+                      ErrorSeverity::FATAL,
+                      "Failed to connect to launcher pipe",
+                      pipe_name_str);
+        detachSignalBus();
         return 1;
     }
 
@@ -725,6 +809,10 @@ int main(int argc, char* argv[]) {
 
     if (g_pipe->writeLine(register_msg) != PipeResult::PIPE_OK) {
         LOG_ERROR("Failed to send registration message");
+        publish_error(ErrorCode::PIPE_ERROR,
+                      ErrorSeverity::FATAL,
+                      "Failed to send registration message to launcher",
+                      "writeLine returned non-PIPE_OK");
     } else {
         LOG_INFO("Registration message sent: " + register_msg);
     }
@@ -780,59 +868,54 @@ int main(int argc, char* argv[]) {
         statusProvider->setStatusText("开发模式 - 从源码加载");
     }
 
-    QString app_dir = QCoreApplication::applicationDirPath();
-    LOG_INFO("Application directory: " + app_dir.toStdString());
+    LOG_INFO("Application directory: " +
+             QCoreApplication::applicationDirPath().toStdString());
 
-    QString placeholder_path;
-    if (dev_mode) {
-        QString project_root = QDir::currentPath();
-        QDir proj_dir(project_root);
-        if (proj_dir.dirName() == "bin") {
-            proj_dir.cdUp();
-            proj_dir.cdUp();
-        }
-        placeholder_path = proj_dir.filePath("src/gui/qml/main.qml");
-        QUrl url = QUrl::fromLocalFile(placeholder_path);
-        if (QFile::exists(placeholder_path)) {
-            engine->load(url);
-            LOG_INFO("Development placeholder loaded from: " + placeholder_path.toStdString());
-        } else {
-            LOG_WARN("Development placeholder not found, trying build directory");
-            placeholder_path = QDir(app_dir).filePath("src/gui/qml/main.qml");
-            engine->load(QUrl::fromLocalFile(placeholder_path));
-        }
-    } else {
-        QDir base_dir2(app_dir);
-        bool up1 = base_dir2.cdUp();
-        bool up2 = base_dir2.cdUp();
-        if (up1 && up2) {
-            placeholder_path = base_dir2.filePath("src/gui/qml/main.qml");
-        } else {
-            placeholder_path = app_dir + "/../src/gui/qml/main.qml";
-        }
-        QUrl url = QUrl::fromLocalFile(placeholder_path);
-        if (QFile::exists(placeholder_path)) {
-            engine->load(url);
-            LOG_INFO("Placeholder loaded from: " + placeholder_path.toStdString());
-        } else {
-            LOG_ERROR("Placeholder QML not found at: " + placeholder_path.toStdString());
-            engine->load(QUrl::fromLocalFile("../src/gui/qml/main.qml"));
+    // A.5.5：loading 窗口路径解析
+    //   主路径：<exe_dir>/plugins/system/dream_machine_default/qml/loading.qml
+    //   （CMake 复制 default_plugin 时自动带入；部署版随 bin/ 一起走）
+    //   兜底：源码树 src/default_plugin/qml/loading.qml（仅 DM_DEV_MODE=1）
+    const char* LOADING_REL =
+        "plugins/system/dream_machine_default/qml/loading.qml";
+    QString loading_path = QString::fromStdString(common::pathFromRoot(LOADING_REL));
+
+    if (!QFile::exists(loading_path) && isDevMode()) {
+        QString root = QString::fromStdString(common::getProjectRootPath());
+        if (!root.isEmpty()) {
+            QString dev_path = QDir(root).filePath("src/default_plugin/qml/loading.qml");
+            if (QFile::exists(dev_path)) {
+                LOG_INFO("Loading QML found (dev): " + dev_path.toStdString());
+                loading_path = dev_path;
+            }
         }
     }
 
+    if (!QFile::exists(loading_path)) {
+        LOG_ERROR("Loading QML not found: " + loading_path.toStdString());
+        publish_error(ErrorCode::CONFIG_NOT_FOUND,
+                      ErrorSeverity::FATAL,
+                      "Loading QML not found",
+                      loading_path.toStdString());
+        detachSignalBus();
+        return 1;
+    }
+
+    LOG_INFO("Loading window loaded from: " + loading_path.toStdString());
+    engine->load(QUrl::fromLocalFile(loading_path));
+
     if (!engine->rootObjects().isEmpty()) {
-        g_placeholderWindow = engine->rootObjects().first();
-        g_placeholderWindow->setObjectName("placeholder");
-        LOG_INFO("Placeholder window created (initially hidden)");
+        g_loadingWindow = engine->rootObjects().first();
+        g_loadingWindow->setObjectName("loading");
+        LOG_INFO("Loading window created (initially hidden)");
     }
 
     auto showTimer = std::make_unique<QTimer>();
-    g_showPlaceholderTimer = std::move(showTimer);
-    g_showPlaceholderTimer->setSingleShot(true);
-    g_showPlaceholderTimer->setInterval(500);
-    QObject::connect(g_showPlaceholderTimer.get(), &QTimer::timeout, showPlaceholderWindow);
-    g_showPlaceholderTimer->start();
-    LOG_INFO("Placeholder show timer started (500ms)");
+    g_showLoadingTimer = std::move(showTimer);
+    g_showLoadingTimer->setSingleShot(true);
+    g_showLoadingTimer->setInterval(500);
+    QObject::connect(g_showLoadingTimer.get(), &QTimer::timeout, showLoadingWindow);
+    g_showLoadingTimer->start();
+    LOG_INFO("Loading show timer started (500ms)");
 
     auto timeoutTimer = std::make_unique<QTimer>();
     g_timeoutTimer = std::move(timeoutTimer);
@@ -852,8 +935,8 @@ int main(int argc, char* argv[]) {
     LOG_INFO("Shutting down GUI...");
     pollTimer.stop();
 
-    if (g_showPlaceholderTimer) {
-        g_showPlaceholderTimer->stop();
+    if (g_showLoadingTimer) {
+        g_showLoadingTimer->stop();
     }
     if (g_timeoutTimer) {
         g_timeoutTimer->stop();
@@ -863,13 +946,13 @@ int main(int argc, char* argv[]) {
         g_pluginLoader->reset();
     }
 
-    if (g_placeholderWindow) {
-        g_placeholderWindow->deleteLater();
-        g_placeholderWindow.clear();
+    if (g_loadingWindow) {
+        g_loadingWindow->deleteLater();
+        g_loadingWindow.clear();
     }
 
     g_pipe.reset();
-    g_showPlaceholderTimer.reset();
+    g_showLoadingTimer.reset();
     g_timeoutTimer.reset();
 
     g_sessionManager.clear();
@@ -877,6 +960,8 @@ int main(int argc, char* argv[]) {
     g_pluginLoader.reset();
     g_statusProvider.clear();
     g_themeManager.reset();
+
+    detachSignalBus();
 
     LOG_INFO("=== GUI exited with code " + std::to_string(result) + " ===");
 
